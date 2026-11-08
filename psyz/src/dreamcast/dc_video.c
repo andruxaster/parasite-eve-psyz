@@ -7,11 +7,7 @@
 #include <psyz/log.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <dc/video.h>
-#include <kos/timer.h>
 #include "../draw.h"
-
-static uint64_t boot_us;
 
 void Psyz_SetTitle(const char* str) { (void)str; }
 void Psyz_SetWindowScale(int scale) { (void)scale; }
@@ -74,25 +70,6 @@ unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h) {
         *h = 0;
     }
     return NULL;
-}
-
-// mode < 0: vertical blanks since start-up; 1: no wait; 0: wait for the
-// next blank; n > 1: wait n blanks.
-int Psyz_VideoVSync(int mode) {
-    if (!boot_us) {
-        boot_us = timer_us_gettime64();
-    }
-    if (mode < 0) {
-        return (int)((timer_us_gettime64() - boot_us) / 16683u);
-    }
-    if (mode == 1) {
-        return 0;
-    }
-    int count = mode > 1 ? mode : 1;
-    while (count--) {
-        vid_waitvbl();
-    }
-    return 0;
 }
 
 // HD sprite atlases are a desktop feature.
