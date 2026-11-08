@@ -1825,6 +1825,21 @@ typedef struct {
     float x, y, w;
 } PgxpSxyEntry;
 
+/* PSYZ_NO_PGXP compiles PGXP out: pgxp_active becomes a constant 0, so
+ * every PGXP path below (all guarded by it) folds away, including the
+ * double-precision work in the GTE commands. The caches shrink to one entry
+ * because only that dead code refers to them. */
+#ifdef PSYZ_NO_PGXP
+#undef PGXP_ADDR_SETS
+#undef PGXP_ADDR_WAYS
+#undef PGXP_SXY_SETS
+#undef PGXP_SXY_WAYS
+#define PGXP_ADDR_SETS 1u
+#define PGXP_ADDR_WAYS 1u
+#define PGXP_SXY_SETS 1u
+#define PGXP_SXY_WAYS 1u
+#endif
+
 /* Cache sizes can be lowered by the build for hosts with little RAM.
  * Set counts must be powers of two. */
 #ifndef PGXP_ADDR_SETS
@@ -1850,7 +1865,11 @@ void Psyz_PgxpTraceReasonsTake(PsyzPgxpReasons *out) {
     if (out) *out = pgxp_reasons;
     memset(&pgxp_reasons, 0, sizeof(pgxp_reasons));
 }
+#ifdef PSYZ_NO_PGXP
+#define pgxp_active 0
+#else
 static int pgxp_active = 0;
+#endif
 static int pgxp_culling = 1;
 static int pgxp_effect_enabled = 0;
 static int pgxp_effect_mode = 0;
@@ -1876,6 +1895,9 @@ static inline unsigned int PgxpHashSxy(unsigned int sxy) {
 }
 
 void Psyz_PgxpSetActive(int active) {
+#ifdef PSYZ_NO_PGXP
+    (void)active;
+#else
     if (pgxp_active && !active) {
         memset(pgxp_addr_cache, 0, sizeof(pgxp_addr_cache));
         memset(pgxp_sxy_cache, 0, sizeof(pgxp_sxy_cache));
@@ -1885,6 +1907,7 @@ void Psyz_PgxpSetActive(int active) {
         pgxp_matrix_valid = 0;
         pgxp_effect_mode = 0;
     }
+#endif
 }
 
 void Psyz_PgxpNextFrame(void) {
