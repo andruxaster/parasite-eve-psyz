@@ -1825,10 +1825,20 @@ typedef struct {
     float x, y, w;
 } PgxpSxyEntry;
 
+/* Cache sizes can be lowered by the build for hosts with little RAM.
+ * Set counts must be powers of two. */
+#ifndef PGXP_ADDR_SETS
 #define PGXP_ADDR_SETS 8192u
+#endif
+#ifndef PGXP_ADDR_WAYS
 #define PGXP_ADDR_WAYS 8u
+#endif
+#ifndef PGXP_SXY_SETS
 #define PGXP_SXY_SETS 4096u
+#endif
+#ifndef PGXP_SXY_WAYS
 #define PGXP_SXY_WAYS 2u
+#endif
 
 static int pgxp_reason_trace;
 static PsyzPgxpReasons pgxp_reasons;
