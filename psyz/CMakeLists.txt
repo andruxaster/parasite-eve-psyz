@@ -300,7 +300,9 @@ elseif(PSYZ_DREAMCAST)
     list(APPEND PSYZ_SOURCES src/dreamcast/dc_gpu.c)
     list(APPEND PSYZ_SOURCES src/dreamcast/dc_input.c)
     list(APPEND PSYZ_SOURCES src/dreamcast/dc_audio.c)
-    list(APPEND PSYZ_SOURCES src/psyz/psyz_spu.c)
+    # The SPU's voices play on AICA channels; see src/dreamcast/dc_spu.c.
+    list(APPEND PSYZ_SOURCES src/dreamcast/dc_spu.c)
+    list(APPEND PSYZ_SOURCES src/dreamcast/dc_aica.c)
 elseif(PSP)
     # The pspdev toolchain provides the SDK include/link paths; the GE, the
     # display, the controller and the audio channel are driven directly, so

@@ -1,6 +1,6 @@
 # Sega Dreamcast target (KallistiOS)
 
-Status: **draws through the PowerVR; audio is silent.** The PsyZ core and a
+Status: **draws through the PowerVR; sound plays on the AICA (no reverb yet).** The PsyZ core and a
 game compile and link for the SH-4 with KallistiOS. The renderer has been
 checked on the host against a software stand-in for the PVR: a synthetic
 frame (`hosttest/`) and Parasite Eve itself from boot through its movies,
@@ -12,7 +12,9 @@ the desktop software renderer. Not yet on hardware or in an emulator.
 | `dc_gpu.c` | `Draw_*` backend on the PVR, frame pacing (`Psyz_VideoVSync`) | first version |
 | `dc_video.c` | video, widescreen, sprite-atlas, interpolation and keyboard entry points the desktop backends provide | no-op |
 | `dc_input.c` | first Dreamcast controller as a PS1 pad on port 0 (`maple`) | working |
-| `dc_audio.c` | audio lock and init around the portable SPU in `psyz/psyz_spu.c` | no output yet |
+| `dc_audio.c` | audio thread: advances the SPU every 5 ms, feeds CD/XA audio to a KOS sound stream | first version |
+| `dc_spu.c` | the SPU API: registers, envelopes, sample decoding, PS1 voices on AICA channels | first version |
+| `dc_aica.c` | AICA channel registers and sound RAM, from the SH-4 | first version |
 | `dc_os.c` | threads, locks, bells and the microsecond clock on KOS threads, mutexes and semaphores | working |
 | `../platform/plat_unix.c` | file and memory-card directory calls; KOS's VFS (`/cd`, `/pc`, `/sd`...) provides the POSIX calls it uses | shared |
 | `dc_log.c` | `psyz_log` to stderr (dc-tool console) | working |
@@ -54,6 +56,32 @@ the desktop software renderer. Not yet on hardware or in an emulator.
   displayed framebuffer are drawn as quads, as in the PSP backend.
 - **Scale.** The PS1 framebuffer (256-640 x 240/480) is stretched to
   640x480; the horizontal display range is ignored.
+
+## Sound
+
+The portable SPU (`psyz/psyz_spu.c`) mixes 24 voices with Gaussian
+interpolation and reverb per 44.1 kHz sample. On the SH-4 that is 160 to 600
+million instructions per second of sound, more than the CPU has. As the
+PSP backend does with sceSasCore, `dc_spu.c` plays the voices on the sound
+chip and keeps on the CPU what the game reads back:
+
+- **Samples.** SPU RAM stays in main RAM. Written blocks of PS1 ADPCM are
+  decoded to 16-bit PCM in AICA sound RAM (56 bytes per 16-byte block, so
+  512 KB of SPU RAM takes 1.8 MB of the 2 MB).
+- **Voices.** Each PS1 voice owns an AICA channel. At key-on the sample is
+  scanned to its end block; a repeat flag loops it from the last loop-start
+  block or the loop address register. Pitch maps to OCT/FNS.
+- **Envelopes.** The SPU's own ADSR code runs on the CPU, advanced in bulk
+  every update; with the voice and main volumes it sets the channel's total
+  level and pan. ENVX reads back from it. A sample without a repeat ends
+  when its tracked position passes its length.
+- **CD and XA audio** go out on a KOS sound stream at 44.1 kHz.
+
+Not done yet: reverb (the AICA DSP could), noise, pitch modulation, volume
+sweeps and the capture buffers. Interpolation is linear rather than
+Gaussian. In the PC harness, a software model of the channels against the
+software SPU (reverb muted) gives the same envelopes frame for frame and
+levels within 10%.
 
 ## Movies (MDEC)
 
@@ -101,4 +129,4 @@ in the same frame shows up as it would on hardware.
   with the game's real draw/display environments.
 - Speed: vertices through the store queues (`pvr_dr_*`) instead of
   `pvr_prim`, twiddled or paletted textures.
-- Audio on the AICA.
+- Reverb on the AICA DSP.
