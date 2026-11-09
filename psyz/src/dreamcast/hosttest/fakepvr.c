@@ -150,5 +150,8 @@ int pvr_scene_finish(void) {
     printf("%s: %d strips, %d header changes\n", name, prims, headers);
     return 0;
 }
-void vid_waitvbl(void) {}
+static void (*vblank_hnd)(uint32_t, void *);
+int vblank_handler_add(void (*hnd)(uint32_t, void *), void *data) { (void)data; vblank_hnd = hnd; return 1; }
+void vid_waitvbl(void) { if (vblank_hnd) vblank_hnd(0, NULL); }
+int thd_pass(void) { vid_waitvbl(); return 0; }
 uint64_t timer_us_gettime64(void) { return 1; }

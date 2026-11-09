@@ -34,7 +34,9 @@
 #include <stdio.h>
 #endif
 #include <dc/pvr.h>
+#include <dc/vblank.h>
 #include <dc/video.h>
+#include <kos/thread.h>
 #include <kos/timer.h>
 #include "../draw.h"
 
@@ -77,7 +79,10 @@ static int disp_origin_count;
 static bool in_scene;
 static uint32_t frame_no;
 static int frame_vertices;
-static uint64_t boot_us;
+// vertical blanks counted by interrupt, so the count the game reads and the
+// blank it waits for are the same events
+static volatile uint32_t vblank_count;
+static bool vblank_counting;
 
 // blend modes: 0-3 are the PS1 semi-transparency modes, 4 is opaque, 5
 // inverts the framebuffer (used for mode 2)
@@ -870,14 +875,27 @@ static void Present24(void) {
     }
 }
 
+static void VblankIrq(uint32_t code, void* data) {
+    (void)code;
+    (void)data;
+    vblank_count++;
+}
+
+static void StartVblankCount(void) {
+    if (!vblank_counting) {
+        vblank_counting = vblank_handler_add(VblankIrq, NULL) >= 0;
+        if (!vblank_counting) {
+            WARNF("cannot count vertical blanks");
+        }
+    }
+}
+
 // mode < 0: vertical blanks since start-up; 1: no wait; 0: wait for the
 // next blank; n > 1: wait n blanks. The frame drawn so far is shown.
 int Psyz_VideoVSync(int mode) {
-    if (!boot_us) {
-        boot_us = timer_us_gettime64();
-    }
+    StartVblankCount();
     if (mode < 0) {
-        return (int)((timer_us_gettime64() - boot_us) / 16683u);
+        return (int)vblank_count;
     }
     if (mode == 1) {
         return 0;
@@ -886,10 +904,16 @@ int Psyz_VideoVSync(int mode) {
         Present24();
     }
     EndScene();
-    int count = mode > 1 ? mode : 1;
     uint64_t t0 = timer_us_gettime64();
-    while (count--) {
-        vid_waitvbl();
+    uint32_t target = vblank_count + (uint32_t)(mode > 1 ? mode : 1);
+    if (vblank_counting) {
+        while ((int32_t)(vblank_count - target) < 0) {
+            thd_pass();
+        }
+    } else {
+        for (int n = mode > 1 ? mode : 1; n > 0; n--) {
+            vid_waitvbl();
+        }
     }
     stats.vblank_us += timer_us_gettime64() - t0;
     return 0;
