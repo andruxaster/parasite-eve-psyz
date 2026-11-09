@@ -1576,6 +1576,7 @@ static void PushPoly(const u_long* p, int code) {
     // perspective-correct texturing; all of them or none
     float fx[4] = {0, 0, 0, 0}, fy[4] = {0, 0, 0, 0}, z[4] = {0, 0, 0, 0};
     stats.polys++;
+    (void)xy_word; // read only with PSYZ_GTE_SUBPIXEL
 #ifdef PSYZ_GTE_SUBPIXEL
     {
         PsyzSubpixel sp[4];
