@@ -55,6 +55,26 @@ the desktop software renderer. Not yet on hardware or in an emulator.
 - **Scale.** The PS1 framebuffer (256-640 x 240/480) is stretched to
   640x480; the horizontal display range is ignored.
 
+## Movies (MDEC)
+
+The MDEC is the portable one in `../psyz/libpress.c`, exact to the bit
+(each IDCT pass rounded as the PS1 does). On the SH-4 it is built for speed:
+
+- **IDCT.** The SDK's matrix mirrors (even rows symmetric, odd rows
+  `M[7-x] = ~M[x]`), so each pass needs half the products, and only the
+  columns holding coefficients are transformed. The products run on
+  `mac.w`, which reads two 16-bit values and accumulates in one
+  instruction; a column with only its DC term, or a block with only
+  column 0, skips them.
+- **Colour.** Each 2x2 chroma sample becomes three pointers into a
+  clamping table, and pixels are written backwards with pre-decrement
+  byte stores (a byte store with displacement only takes r0).
+
+A 320x240 frame went from about 20 to under 5 million SH-4 instructions
+(about 120 ms to about 30 ms in Flycast), so movies keep their 15 frames
+per second. `hosttest/mdec_check.sh` checks the output against the
+original decoder on random streams.
+
 Not emulated yet: drawing into VRAM and sampling it back as a texture,
 reading rendered pixels back, the draw-area clip, texture windows, mask
 bits, dithering, per-texel STP on semi-transparent primitives (the whole
