@@ -921,7 +921,9 @@ static bool InitPlatform(void) {
           class_count[4], class_count[5],
           (unsigned)(pvr_mem_available() / 1024));
     stats.start_us = timer_us_gettime64();
+#ifndef PE_DC_RELEASE
     DcProf_Start();
+#endif
     is_init = true;
     return true;
 }
@@ -976,7 +978,9 @@ static void EndScene(void) {
               stats.class_decodes[4], stats.class_decodes[5], stats.why[0],
               stats.why[1], stats.why[2], stats.why[3], stats.writes,
               stats.changed);
+#ifndef PE_DC_RELEASE
         DcProf_Report();
+#endif
         memset(&stats, 0, sizeof(stats));
         stats.start_us = now;
     }
