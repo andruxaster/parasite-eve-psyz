@@ -22,10 +22,12 @@ static const u8 scan[64] = {
     35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
     58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63};
 
-static int floor_shift(int64_t value, unsigned shift) {
-    int64_t divisor = INT64_C(1) << shift;
-    return (int)(value >= 0 ? value / divisor
-                            : -((-value + divisor - 1) / divisor));
+// floor(value / 2^shift): an arithmetic right shift. GCC and Clang shift
+// signed values arithmetically on every target PsyZ builds for; written as a
+// shift, it avoids a 64-bit division call per use on CPUs without one (the
+// Dreamcast's SH-4 spent seconds per movie frame in __divdi3).
+static inline int floor_shift(int64_t value, unsigned shift) {
+    return (int)(value >> shift);
 }
 static int clamp(int value, int low, int high) {
     return value < low ? low : value > high ? high : value;
@@ -39,13 +41,15 @@ static u32 read32(const u8* p) { return read16(p) | (u32)read16(p + 2) << 16; }
 
 static void inverse_dct(int block[64]) {
     int work[64];
+    int dct[64];
+    for (unsigned i = 0; i < 64; ++i)
+        dct[i] = floor_shift(mdec.env.dct[i], 3);
     for (unsigned pass = 0; pass < 2; ++pass) {
         for (unsigned y = 0; y < 8; ++y)
             for (unsigned x = 0; x < 8; ++x) {
                 int64_t sum = 0;
                 for (unsigned z = 0; z < 8; ++z)
-                    sum += (int64_t)block[y + z * 8] *
-                           floor_shift(mdec.env.dct[x + z * 8], 3);
+                    sum += (int64_t)block[y + z * 8] * dct[x + z * 8];
                 work[x + y * 8] = floor_shift(sum + 0xfff, 13);
             }
         memcpy(block, work, sizeof(work));

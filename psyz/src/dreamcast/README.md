@@ -25,12 +25,19 @@ the desktop software renderer. Not yet on hardware or in an emulator.
   first primitive and is shown at the game's next `VSync`.
 - **VRAM.** A 1 MB CPU copy of the PS1 VRAM takes uploads, fills and copies,
   and answers `StoreImage`.
-- **Textures.** A primitive's texture page (4, 8 or 16 bpp, plus its CLUT)
-  is decoded from that copy into a 256x256 ARGB1555 texture in PVR memory.
-  Up to 32 pages are cached (about 30 fit beside the framebuffers and the
-  1 MB vertex buffer); writes to VRAM mark them dirty. A page already drawn
-  in the current frame is decoded into another slot rather than overwritten,
-  so earlier primitives keep their texture.
+- **Textures.** A primitive's texels (4, 8 or 16 bpp, plus its CLUT) are
+  decoded from that copy into an ARGB1555 block in PVR memory: the
+  smallest power-of-two rectangle (16 to 256 a side, starting on a
+  multiple of 16) over its UV box. Pools of 1K, 4K, 16K, 32K and 64K-texel
+  slots fill the PVR memory left beside the framebuffers and the vertex
+  buffers (about 5 MB). A page+CLUT that misses several small blocks in a
+  frame, such as a model part drawn as many triangles, gets one region
+  block over all the UVs drawn with it. A slot tracks the texels actually
+  drawn from it, so only writes there make it dirty (page 15 wraps into
+  the framebuffer, which is cleared every frame). A slot drawn in the
+  current frame is never overwritten: the PVR reads textures when it
+  renders the finished scene, after the CPU has moved on. Every 300 frames
+  the backend logs frame rate, decodes and where the time went.
 - **Transparency.** Colour 0 is transparent. Semi-transparency modes 0
   (B/2+F/2), 1 (B+F) and 3 (B+F/4) use PVR blending with vertex alpha.
   Mode 2 (B-F) has no PVR blend, so the primitive is drawn three times:
@@ -64,7 +71,9 @@ cmake -S . -B build-dc -DCMAKE_TOOLCHAIN_FILE=$KOS_BASE/utils/cmake/kallistios.t
 `hosttest/build.sh` renders a synthetic frame (every texture depth, CLUTs,
 sprites, Gouraud, the four blend modes, lines, an upload into the
 framebuffer, a CLUT change mid-frame) through `dc_gpu.c` on a 32-bit host
-build and writes `frame0.ppm` and `frame1.ppm`.
+build and writes `frame0.ppm` and `frame1.ppm`. Like the PVR, its stand-in
+draws a scene only when it is finished, so a texture overwritten after use
+in the same frame shows up as it would on hardware.
 
 ## Next
 

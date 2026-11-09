@@ -30,6 +30,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#ifdef DCGPU_TRACE
+#include <stdio.h>
+#endif
 #include <dc/pvr.h>
 #include <dc/video.h>
 #include <kos/timer.h>
@@ -66,7 +69,9 @@ static struct {
 static int disp_origin_count;
 
 // ===== PVR scene =====
-#define PVR_VERTEX_BUF (1024 * 1024)
+// Parameter memory for one frame (KOS keeps two). Parasite Eve's busiest
+// frames so far take under 6000 vertices; this holds about 10900.
+#define PVR_VERTEX_BUF (512 * 1024)
 // TA parameter space is finite; stop adding geometry before it overflows
 #define MAX_FRAME_VERTICES (PVR_VERTEX_BUF / 48)
 static bool in_scene;
@@ -82,53 +87,142 @@ static uint64_t boot_us;
 static const uint8_t blend_alpha[BLEND_MODES] = {128, 255, 255, 64, 255, 255};
 
 // ===== texture cache =====
-#define TEX_SLOTS_MAX 32
-#define TEX_BYTES (256 * 256 * 2)
+// A slot holds one rectangular block of a PS1 texture page, decoded with its
+// CLUT to ARGB1555. Width and height are powers of two from 16 to 256; the
+// block starts on a multiple of 16 texels and wraps inside the page past its
+// edge, as PS1 texture coordinates do. Slots come in five pools by size
+// (1K, 4K, 16K, 32K and 64K texels), so a 16K slot holds 128x128, 256x64
+// or 64x256. A primitive takes the smallest block over its UV box; a page+CLUT
+// busy with many small blocks in one frame (a model part drawn as many small
+// triangles) gets one region block over everything drawn with it so far,
+// when a slot that size is free this frame.
+#define TEX_CLASSES 5
 #define RAW_TEXTURE 1 // variant: every texel opaque (VRAM region blits)
+static const int class_texels[TEX_CLASSES] = {1024, 4096, 16384, 32768,
+                                              65536};
+static const int class_max[TEX_CLASSES] = {256, 128, 48, 16, 8};
+#define TEX_SLOTS_MAX (256 + 128 + 48 + 16 + 8)
+#define TEX_HASH 1024
+#define RETIRED_KEY (UINT64_C(3) << 5) // bpp 3: TexKey never builds it
 
-typedef struct {
+typedef struct TexSlot {
     pvr_ptr_t ptr;
-    bool valid;
-    bool dirty;
-    uint32_t key;
+    struct TexSlot* next; // hash chain
+    uint64_t key;
     uint32_t last_used;
     uint32_t used_frame;
-    uint8_t hdr_ready; // bitmask of compiled blend headers
-    pvr_poly_hdr_t hdr[BLEND_MODES];
+    uint16_t u0, v0; // block origin in the page, texels
+    uint16_t w, h;   // block size, texels
+    // texels drawn from it so far (page coordinates, inclusive): only
+    // writes there make it dirty; a write elsewhere in the block sets
+    // stale_outside, and the block is decoded again if drawing ever
+    // reaches past the used box
+    int16_t used_u0, used_v0, used_u1, used_v1;
+    uint8_t cls;
+    bool valid;
+    bool dirty;
+    bool stale_outside;
 } TexSlot;
 
+typedef struct {
+    int cls;
+    int u0, v0, w, h;
+} Block;
+
 static TexSlot tex_slots[TEX_SLOTS_MAX];
+static int class_first[TEX_CLASSES], class_count[TEX_CLASSES];
 static int tex_slot_count;
+static TexSlot* tex_hash[TEX_HASH];
 static uint32_t tex_clock;
 static TexSlot* memo_slot;
-static uint32_t memo_key;
+static uint64_t memo_key;
 static pvr_poly_hdr_t col_hdr[BLEND_MODES];
+
+// Per page+CLUT: the union of every UV box drawn with it, and the region
+// block once it has one. A page+CLUT unused for a while (a room change
+// loads new textures) starts over.
+#define PROMOTE_MISSES 4
+#define PAGE_STAT_IDLE_FRAMES 30
+#define PAGE_STATS 512
+typedef struct {
+    uint64_t page_key;
+    uint32_t frame;
+    uint32_t misses;
+    uint32_t promoted_frame;
+    int16_t umin, vmin, umax, vmax;
+    bool has_region;
+    Block region;
+} PageStat;
+static PageStat page_stats[PAGE_STATS];
+
+// per-period statistics, logged every STATS_FRAMES frames
+#define STATS_FRAMES 300
+static struct {
+    uint32_t decodes, decoded_texels, overwrites, vertices, frames;
+    uint64_t decode_us, start_us;
+    uint64_t pvr_wait_us; // pvr_wait_ready: the PVR still drawing
+    uint64_t vblank_us;   // vid_waitvbl: nothing left to do this frame
+    uint64_t movie_us;    // converting 24-bit movie frames
+} stats;
 
 // 24-bit display: the whole picture as one RGB565 texture
 #define FRAME24_W 512
-#define FRAME24_H 512
+#define FRAME24_H 256 // the movies are 240 lines; taller pictures are cut
 static pvr_ptr_t frame24;
 static pvr_poly_hdr_t frame24_hdr;
 static int frame24_hdr_h;
 static bool frame24_dirty = true;
 static int cur_hdr = -1; // slot index * BLEND_MODES + mode, or -1 - mode
 
-static inline uint32_t TexKey(u16 tpage, u16 clut, int variant) {
-    uint32_t bpp = (tpage >> 7) & 3;
+static inline int Log2(int v) {
+    int l = 0;
+    while ((1 << l) < v) {
+        l++;
+    }
+    return l;
+}
+
+// key: page 0-4, bpp 5-6, log2 w - 4 7-9, log2 h - 4 10-12, origin u / 16
+// 13-16, origin v / 16 17-20, then the CLUT (15 bits) for 4 and 8 bpp or
+// the raw flag for 16 bpp from bit 21
+static inline uint64_t TexKey(u16 tpage, u16 clut, int variant,
+                              const Block* b) {
+    uint64_t bpp = (tpage >> 7) & 3;
     if (bpp > 2) {
         bpp = 2;
     }
-    uint32_t key = (tpage & 0x1F) | (bpp << 5) | ((uint32_t)variant << 7);
-    if (bpp < 2) {
-        key |= (uint32_t)clut << 8;
-    }
+    uint64_t key = (uint64_t)(tpage & 0x1F) | (bpp << 5) |
+                   ((uint64_t)(Log2(b->w) - 4) << 7) |
+                   ((uint64_t)(Log2(b->h) - 4) << 10) |
+                   ((uint64_t)(b->u0 >> 4) << 13) |
+                   ((uint64_t)(b->v0 >> 4) << 17);
+    key |= bpp < 2 ? (uint64_t)(clut & 0x7FFF) << 21 : (uint64_t)variant << 21;
     return key;
 }
 
-static void KeyPageRect(uint32_t key, int* x, int* y, int* w) {
-    *x = (int)(key & 0xF) * 64;
-    *y = (int)((key >> 4) & 1) * 256;
-    *w = 64 << ((key >> 5) & 3); // halfwords: 64 4bpp, 128 8bpp, 256 16bpp
+static inline uint32_t KeyClut(uint64_t key) { return (uint32_t)(key >> 21); }
+
+static inline unsigned HashKey(uint64_t key) {
+    uint32_t k = (uint32_t)key ^ (uint32_t)(key >> 32) * 0x9E3779B1u;
+    return (k * 2654435761u) >> 22; // 10 bits
+}
+
+static void HashRemove(TexSlot* s) {
+    TexSlot** p = &tex_hash[HashKey(s->key)];
+    while (*p) {
+        if (*p == s) {
+            *p = s->next;
+            break;
+        }
+        p = &(*p)->next;
+    }
+    s->next = NULL;
+}
+
+static void HashInsert(TexSlot* s) {
+    unsigned h = HashKey(s->key);
+    s->next = tex_hash[h];
+    tex_hash[h] = s;
 }
 
 static inline bool Overlaps(
@@ -136,30 +230,71 @@ static inline bool Overlaps(
     return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
 }
 
+// VRAM rectangle (halfwords) of texels [tu0, tu1] x [tv0, tv1] of the
+// slot's page; a span that wraps past the page edge reports the whole page
+// width or height
+static void PageVramRect(const TexSlot* s, int tu0, int tv0, int tu1, int tv1,
+                         int* x, int* y, int* w, int* h) {
+    int bpp = (int)(s->key >> 5) & 3;
+    int shift = 2 - bpp; // texels per halfword: 4, 2, 1
+    int page_x = (int)(s->key & 0xF) * 64;
+    int page_y = (int)((s->key >> 4) & 1) * 256;
+    if (tu1 > 255) {
+        *x = page_x;
+        *w = 256 >> shift;
+    } else {
+        *x = page_x + (tu0 >> shift);
+        *w = (tu1 >> shift) - (tu0 >> shift) + 1;
+    }
+    if (tv1 > 255) {
+        *y = page_y;
+        *h = 256;
+    } else {
+        *y = page_y + tv0;
+        *h = tv1 - tv0 + 1;
+    }
+}
+
+// does VRAM rectangle (x, y, w, h) touch rectangle b, which may run past
+// the right edge of VRAM and wrap to x 0?
+static bool HitsWrapped(int x, int y, int w, int h, int bx, int by, int bw,
+                        int bh) {
+    if (Overlaps(x, y, w, h, bx, by, bw, bh)) {
+        return true;
+    }
+    return bx + bw > VRAM_W &&
+           Overlaps(x, y, w, h, 0, by, bx + bw - VRAM_W, bh);
+}
+
 static void InvalidateVram(int x, int y, int w, int h) {
     memo_slot = NULL;
     frame24_dirty = true;
     for (int i = 0; i < tex_slot_count; i++) {
         TexSlot* s = &tex_slots[i];
-        if (!s->valid || s->dirty) {
+        if (!s->valid || s->dirty || s->key == RETIRED_KEY) {
             continue;
         }
-        int px, py, pw;
-        KeyPageRect(s->key, &px, &py, &pw);
-        bool hit = Overlaps(x, y, w, h, px, py, pw, 256);
-        // pages at the right edge of VRAM wrap to x 0
-        if (!hit && px + pw > VRAM_W) {
-            hit = Overlaps(x, y, w, h, 0, py, px + pw - VRAM_W, 256);
-        }
         uint32_t bpp = (s->key >> 5) & 3;
-        if (!hit && bpp < 2) {
-            uint32_t clut = s->key >> 8 & 0xFFFF;
+        if (bpp < 2) {
+            uint32_t clut = KeyClut(s->key);
             int cx = (int)(clut & 0x3F) * 16;
             int cy = (int)(clut >> 6) & 0x1FF;
-            hit = Overlaps(x, y, w, h, cx, cy, bpp ? 256 : 16, 1);
+            if (Overlaps(x, y, w, h, cx, cy, bpp ? 256 : 16, 1)) {
+                s->dirty = true;
+                continue;
+            }
         }
-        if (hit) {
+        int bx, by, bw, bh;
+        PageVramRect(s, s->used_u0, s->used_v0, s->used_u1, s->used_v1, &bx,
+                     &by, &bw, &bh);
+        if (HitsWrapped(x, y, w, h, bx, by, bw, bh)) {
             s->dirty = true;
+            continue;
+        }
+        if (!s->stale_outside) {
+            PageVramRect(s, s->u0, s->v0, s->u0 + s->w - 1, s->v0 + s->h - 1,
+                         &bx, &by, &bw, &bh);
+            s->stale_outside = HitsWrapped(x, y, w, h, bx, by, bw, bh);
         }
     }
 }
@@ -172,56 +307,88 @@ static inline uint16_t Convert(uint16_t c, int raw) {
 }
 
 static void DecodeSlot(TexSlot* s) {
-    uint32_t key = s->key;
-    int x0, y0, w;
-    KeyPageRect(key, &x0, &y0, &w);
+    uint64_t t0 = timer_us_gettime64();
+    uint64_t key = s->key;
+    int page_x = (int)(key & 0xF) * 64;
+    int page_y = (int)((key >> 4) & 1) * 256;
     int bpp = (int)(key >> 5) & 3;
-    int raw = (int)(key >> 7) & 1;
+    int raw = bpp == 2 ? (int)KeyClut(key) & 1 : 0;
+    int w = s->w, h = s->h;
     uint32_t* dst = (uint32_t*)s->ptr;
     if (bpp == 2) {
-        for (int v = 0; v < 256; v++) {
-            const uint16_t* row = &vram[((y0 + v) & (VRAM_H - 1)) * VRAM_W];
-            for (int u = 0; u < 256; u += 2) {
-                uint16_t a = Convert(row[(x0 + u) & (VRAM_W - 1)], raw);
-                uint16_t b = Convert(row[(x0 + u + 1) & (VRAM_W - 1)], raw);
+        for (int v = 0; v < h; v++) {
+            const uint16_t* row =
+                &vram[((page_y + ((s->v0 + v) & 255)) & (VRAM_H - 1)) * VRAM_W];
+            for (int u = 0; u < w; u += 2) {
+                int ua = (s->u0 + u) & 255, ub = (s->u0 + u + 1) & 255;
+                uint16_t a = Convert(row[(page_x + ua) & (VRAM_W - 1)], raw);
+                uint16_t b = Convert(row[(page_x + ub) & (VRAM_W - 1)], raw);
                 *dst++ = a | ((uint32_t)b << 16);
             }
         }
-        return;
-    }
-    uint32_t clut = (key >> 8) & 0xFFFF;
-    int cx = (int)(clut & 0x3F) * 16;
-    int cy = (int)(clut >> 6) & 0x1FF;
-    int colors = bpp ? 256 : 16;
-    uint16_t pal[256];
-    for (int i = 0; i < colors; i++) {
-        pal[i] = Convert(vram[cy * VRAM_W + ((cx + i) & (VRAM_W - 1))], raw);
-    }
-    for (int v = 0; v < 256; v++) {
-        const uint16_t* row = &vram[((y0 + v) & (VRAM_H - 1)) * VRAM_W];
-        if (bpp == 0) {
-            for (int i = 0; i < 64; i++) {
-                uint16_t h = row[(x0 + i) & (VRAM_W - 1)];
-                *dst++ = pal[h & 0xF] | ((uint32_t)pal[(h >> 4) & 0xF] << 16);
-                *dst++ = pal[(h >> 8) & 0xF] | ((uint32_t)pal[h >> 12] << 16);
-            }
-        } else {
-            for (int i = 0; i < 128; i++) {
-                uint16_t h = row[(x0 + i) & (VRAM_W - 1)];
-                *dst++ = pal[h & 0xFF] | ((uint32_t)pal[h >> 8] << 16);
+    } else {
+        uint32_t clut = KeyClut(key);
+        int cx = (int)(clut & 0x3F) * 16;
+        int cy = (int)(clut >> 6) & 0x1FF;
+        int colors = bpp ? 256 : 16;
+        uint16_t pal[256];
+        for (int i = 0; i < colors; i++) {
+            pal[i] =
+                Convert(vram[cy * VRAM_W + ((cx + i) & (VRAM_W - 1))], raw);
+        }
+        int halfwords = bpp ? w / 2 : w / 4;
+        int page_halfwords = bpp ? 128 : 64;
+        int h0 = bpp ? s->u0 / 2 : s->u0 / 4;
+        for (int v = 0; v < h; v++) {
+            const uint16_t* row =
+                &vram[((page_y + ((s->v0 + v) & 255)) & (VRAM_H - 1)) * VRAM_W];
+            if (bpp == 0) {
+                for (int i = 0; i < halfwords; i++) {
+                    int hx = page_x + ((h0 + i) & (page_halfwords - 1));
+                    uint16_t px = row[hx & (VRAM_W - 1)];
+                    *dst++ = pal[px & 0xF] |
+                             ((uint32_t)pal[(px >> 4) & 0xF] << 16);
+                    *dst++ = pal[(px >> 8) & 0xF] |
+                             ((uint32_t)pal[px >> 12] << 16);
+                }
+            } else {
+                for (int i = 0; i < halfwords; i++) {
+                    int hx = page_x + ((h0 + i) & (page_halfwords - 1));
+                    uint16_t px = row[hx & (VRAM_W - 1)];
+                    *dst++ = pal[px & 0xFF] | ((uint32_t)pal[px >> 8] << 16);
+                }
             }
         }
     }
+#ifdef DCGPU_TRACE
+    {
+        extern int g_fake_capture;
+        if (g_fake_capture) {
+            fprintf(stderr, "decode f%u %dx%d page %u bpp %d raw %d clut %04X origin %d,%d\n",
+                    (unsigned)frame_no, w, h, (unsigned)(key & 0x1F), bpp, raw,
+                    (unsigned)KeyClut(key), s->u0, s->v0);
+        }
+    }
+#endif
+    stats.decodes++;
+    stats.decoded_texels += (uint32_t)(w * h);
+    stats.decode_us += timer_us_gettime64() - t0;
 }
 
-static TexSlot* PickVictim(void) {
+// Least recently used slot of `cls` not drawn this frame (its texture is
+// read when the frame renders); with `force`, the oldest even if it was.
+static TexSlot* PickVictim(int cls, bool force) {
     TexSlot* best = NULL;
-    for (int i = 0; i < tex_slot_count; i++) {
+    TexSlot* oldest = NULL;
+    int first = class_first[cls], end = first + class_count[cls];
+    for (int i = first; i < end; i++) {
         TexSlot* s = &tex_slots[i];
         if (!s->valid) {
             return s;
         }
-        // a slot drawn this frame is still read by the pending render
+        if (!oldest || s->last_used < oldest->last_used) {
+            oldest = s;
+        }
         if (s->used_frame == frame_no) {
             continue;
         }
@@ -229,48 +396,77 @@ static TexSlot* PickVictim(void) {
             best = s;
         }
     }
-    if (!best) {
-        LOG_ONCE("texture cache full within one frame; textures may glitch");
-        best = &tex_slots[0];
-        for (int i = 1; i < tex_slot_count; i++) {
-            if (tex_slots[i].last_used < best->last_used) {
-                best = &tex_slots[i];
+    if (!best && force && oldest) {
+        stats.overwrites++;
+        best = oldest;
+#ifdef DCGPU_TRACE
+        {
+            extern int g_fake_capture;
+            if (g_fake_capture) {
+                fprintf(stderr, "overwrite f%u class %d\n", (unsigned)frame_no, cls);
             }
         }
+#endif
     }
     return best;
 }
 
-static TexSlot* FindTexture(u16 tpage, u16 clut, int variant) {
-    uint32_t key = TexKey(tpage, clut, variant);
-    if (memo_slot && memo_key == key) {
-        return memo_slot;
-    }
-    TexSlot* s = NULL;
-    for (int i = 0; i < tex_slot_count; i++) {
-        if (tex_slots[i].valid && tex_slots[i].key == key) {
-            s = &tex_slots[i];
-            break;
-        }
+static TexSlot* LookupSlot(uint64_t key) {
+    TexSlot* s = tex_hash[HashKey(key)];
+    while (s && !(s->valid && s->key == key)) {
+        s = s->next;
     }
     if (s && s->dirty && s->used_frame == frame_no) {
         // changed after being drawn this frame: decode the new contents
-        // elsewhere so earlier primitives keep the old ones
-        s->valid = false;
+        // elsewhere so earlier primitives keep the old ones. The old slot
+        // leaves the hash under a key no lookup builds (bpp 3) but stays
+        // valid, so PickVictim keeps it until the frame is rendered.
+        HashRemove(s);
+        s->key = RETIRED_KEY;
+        s->dirty = false;
         s = NULL;
     }
+    return s;
+}
+
+// texels the current primitive reads, page coordinates (inclusive)
+static int req_u0, req_v0, req_u1, req_v1;
+
+static TexSlot* UseSlot(TexSlot* s, uint64_t key, const Block* b) {
     if (!s) {
-        s = PickVictim();
-        if (!s) {
-            return NULL;
+        return NULL;
+    }
+    if (s->key != key || !s->valid) {
+        if (s->valid) {
+            HashRemove(s);
         }
         s->valid = true;
         s->dirty = true;
         s->key = key;
+        s->u0 = (uint16_t)b->u0;
+        s->v0 = (uint16_t)b->v0;
+        s->w = (uint16_t)b->w;
+        s->h = (uint16_t)b->h;
+        HashInsert(s);
+    }
+    bool beyond = req_u0 < s->used_u0 || req_v0 < s->used_v0 ||
+                  req_u1 > s->used_u1 || req_v1 > s->used_v1;
+    if (beyond && s->stale_outside) {
+        s->dirty = true;
     }
     if (s->dirty) {
         DecodeSlot(s);
         s->dirty = false;
+        s->stale_outside = false;
+        s->used_u0 = (int16_t)req_u0;
+        s->used_v0 = (int16_t)req_v0;
+        s->used_u1 = (int16_t)req_u1;
+        s->used_v1 = (int16_t)req_v1;
+    } else if (beyond) {
+        s->used_u0 = (int16_t)(req_u0 < s->used_u0 ? req_u0 : s->used_u0);
+        s->used_v0 = (int16_t)(req_v0 < s->used_v0 ? req_v0 : s->used_v0);
+        s->used_u1 = (int16_t)(req_u1 > s->used_u1 ? req_u1 : s->used_u1);
+        s->used_v1 = (int16_t)(req_v1 > s->used_v1 ? req_v1 : s->used_v1);
     }
     s->last_used = ++tex_clock;
     s->used_frame = frame_no;
@@ -279,8 +475,169 @@ static TexSlot* FindTexture(u16 tpage, u16 clut, int variant) {
     return s;
 }
 
+static inline bool MemoHolds(uint64_t key) {
+    return memo_slot && memo_key == key && req_u0 >= memo_slot->used_u0 &&
+           req_v0 >= memo_slot->used_v0 && req_u1 <= memo_slot->used_u1 &&
+           req_v1 <= memo_slot->used_v1;
+}
+
+// the cached block, else a fresh slot for it (NULL when every slot of its
+// pool is in use this frame, unless `force`)
+static TexSlot* GetBlock(u16 tpage, u16 clut, int variant, const Block* b,
+                         bool force) {
+    uint64_t key = TexKey(tpage, clut, variant, b);
+    if (MemoHolds(key)) {
+        return memo_slot;
+    }
+    TexSlot* s = LookupSlot(key);
+    if (!s) {
+        s = PickVictim(b->cls, force);
+    }
+    return UseSlot(s, key, b);
+}
+
+static const Block whole_page = {TEX_CLASSES - 1, 0, 0, 256, 256};
+
+// The smallest block of pool `min_cls` or larger holding texels
+// [umin, umax] x [vmin, vmax]; the whole page if nothing smaller does.
+// Spare room in the pool's size goes to the shorter side.
+static Block ChooseBlock(int umin, int vmin, int umax, int vmax, int min_cls) {
+    if (umin < 0 || vmin < 0 || umax > 255 || vmax > 255) {
+        return whole_page;
+    }
+    Block b;
+    b.u0 = umin & ~15;
+    b.v0 = vmin & ~15;
+    b.w = 1 << Log2(umax - b.u0 + 1);
+    b.h = 1 << Log2(vmax - b.v0 + 1);
+    b.w = b.w < 16 ? 16 : b.w;
+    b.h = b.h < 16 ? 16 : b.h;
+    for (b.cls = min_cls; b.cls < TEX_CLASSES - 1; b.cls++) {
+        if (class_count[b.cls] && b.w * b.h <= class_texels[b.cls]) {
+            while (b.w * b.h < class_texels[b.cls]) {
+                if ((b.w <= b.h && b.w < 256) || b.h >= 256) {
+                    b.w *= 2;
+                } else {
+                    b.h *= 2;
+                }
+            }
+            if (b.w > 256 || b.h > 256) {
+                continue;
+            }
+            return b;
+        }
+    }
+    return whole_page;
+}
+
+// The block of texture page `tpage` (CLUT `clut`) holding texels
+// [umin, umax] x [vmin, vmax]: the page+CLUT's region block when it has one
+// that holds the box, otherwise the smallest block that does. A box past
+// the page edge takes the whole page, which repeats.
+static TexSlot* FindTexture(u16 tpage, u16 clut, int variant, int umin,
+                            int vmin, int umax, int vmax) {
+    // texels read, clamped to the page; a box past the edge repeats the
+    // page, so it reads all of it
+    if (umin < 0 || vmin < 0 || umax > 255 || vmax > 255) {
+        req_u0 = req_v0 = 0;
+        req_u1 = req_v1 = 255;
+    } else {
+        req_u0 = umin;
+        req_v0 = vmin;
+        req_u1 = umax;
+        req_v1 = vmax;
+    }
+    Block b = ChooseBlock(umin, vmin, umax, vmax, 0);
+    if (b.cls == TEX_CLASSES - 1) {
+#ifdef DCGPU_TRACE
+        {
+            extern int g_fake_capture;
+            if (g_fake_capture) {
+                fprintf(stderr, "fullreq f%u page %u clut %04X %d,%d-%d,%d\n",
+                        (unsigned)frame_no, (unsigned)(tpage & 0x1F), clut,
+                        umin, vmin, umax, vmax);
+            }
+        }
+#endif
+        return GetBlock(tpage, clut, variant, &whole_page, true);
+    }
+    uint64_t page_key = TexKey(tpage, clut, variant, &whole_page);
+    PageStat* ps = &page_stats[HashKey(page_key) % PAGE_STATS];
+    if (ps->page_key != page_key ||
+        frame_no - ps->frame > PAGE_STAT_IDLE_FRAMES) {
+        memset(ps, 0, sizeof(*ps));
+        ps->page_key = page_key;
+        ps->umin = (int16_t)umin;
+        ps->vmin = (int16_t)vmin;
+        ps->umax = (int16_t)umax;
+        ps->vmax = (int16_t)vmax;
+        ps->frame = frame_no;
+    }
+    if (ps->frame != frame_no) {
+        ps->frame = frame_no;
+        ps->misses = 0;
+    }
+    ps->umin = (int16_t)(umin < ps->umin ? umin : ps->umin);
+    ps->vmin = (int16_t)(vmin < ps->vmin ? vmin : ps->vmin);
+    ps->umax = (int16_t)(umax > ps->umax ? umax : ps->umax);
+    ps->vmax = (int16_t)(vmax > ps->vmax ? vmax : ps->vmax);
+#ifdef DCGPU_TRACE
+    {
+        extern int g_fake_capture;
+        if (g_fake_capture) {
+            fprintf(stderr, "box f%u page %u clut %04X %d,%d-%d,%d union %d,%d-%d,%d\n",
+                    (unsigned)frame_no, (unsigned)(tpage & 0x1F), clut, umin, vmin,
+                    umax, vmax, ps->umin, ps->vmin, ps->umax, ps->vmax);
+        }
+    }
+#endif
+    TexSlot* t;
+    if (ps->has_region) {
+        const Block* r = &ps->region;
+        if (umin >= r->u0 && vmin >= r->v0 && umax < r->u0 + r->w &&
+            vmax < r->v0 + r->h) {
+            if ((t = GetBlock(tpage, clut, variant, r, false))) {
+                return t;
+            }
+        }
+    }
+    uint64_t key = TexKey(tpage, clut, variant, &b);
+    if (MemoHolds(key)) {
+        return memo_slot;
+    }
+    if ((t = LookupSlot(key))) {
+        return UseSlot(t, key, &b);
+    }
+    // a block over everything drawn with this page+CLUT so far, at most
+    // once a frame: a region that turns out too small (new tiles coming
+    // into view) grows on a later frame, by which time the union holds all
+    // of this frame's boxes
+    if (++ps->misses > PROMOTE_MISSES &&
+        !(ps->has_region && ps->promoted_frame == frame_no)) {
+        Block r = ChooseBlock(ps->umin, ps->vmin, ps->umax, ps->vmax, 0);
+        if ((t = GetBlock(tpage, clut, variant, &r, false))) {
+            ps->has_region = true;
+            ps->region = r;
+            ps->promoted_frame = frame_no;
+            return t;
+        }
+    }
+    if ((t = GetBlock(tpage, clut, variant, &b, false))) {
+        return t;
+    }
+    // this pool is full this frame: a block from a larger one, then the
+    // whole page, then (last resort, may glitch) the oldest slot
+    for (int c = b.cls + 1; c < TEX_CLASSES; c++) {
+        Block bigger = ChooseBlock(umin, vmin, umax, vmax, c);
+        if ((t = GetBlock(tpage, clut, variant, &bigger, false))) {
+            return t;
+        }
+    }
+    return GetBlock(tpage, clut, variant, &b, true);
+}
+
 static void CompileHeaderFmt(pvr_poly_hdr_t* hdr, pvr_ptr_t txr, int fmt,
-                             int w, int h, int mode) {
+                             int w, int h, int mode, bool clamp) {
     pvr_poly_cxt_t cxt;
     if (txr) {
         pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY,
@@ -288,7 +645,7 @@ static void CompileHeaderFmt(pvr_poly_hdr_t* hdr, pvr_ptr_t txr, int fmt,
                          PVR_FILTER_NONE);
         cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
         cxt.txr.alpha = false; // false enables the texture's alpha
-        cxt.txr.uv_clamp = PVR_UVCLAMP_NONE;
+        cxt.txr.uv_clamp = clamp ? PVR_UVCLAMP_UV : PVR_UVCLAMP_NONE;
     } else {
         pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
     }
@@ -321,7 +678,7 @@ static void CompileHeaderFmt(pvr_poly_hdr_t* hdr, pvr_ptr_t txr, int fmt,
 }
 
 static void CompileHeader(pvr_poly_hdr_t* hdr, pvr_ptr_t txr, int mode) {
-    CompileHeaderFmt(hdr, txr, PVR_TXRFMT_ARGB1555, 256, 256, mode);
+    CompileHeaderFmt(hdr, txr, PVR_TXRFMT_ARGB1555, 256, 256, mode, false);
 }
 
 static void SendHeader(TexSlot* t, int mode) {
@@ -334,11 +691,18 @@ static void SendHeader(TexSlot* t, int mode) {
         pvr_prim(&col_hdr[mode], sizeof(pvr_poly_hdr_t));
         return;
     }
-    if (!(t->hdr_ready & (1 << mode))) {
-        CompileHeader(&t->hdr[mode], t->ptr, mode);
-        t->hdr_ready |= (uint8_t)(1 << mode);
-    }
-    pvr_prim(&t->hdr[mode], sizeof(pvr_poly_hdr_t));
+    pvr_poly_hdr_t hdr;
+    CompileHeaderFmt(&hdr, t->ptr, PVR_TXRFMT_ARGB1555, t->w, t->h, mode,
+                     t->w < 256 || t->h < 256);
+    pvr_prim(&hdr, sizeof(hdr));
+}
+
+// texture coordinate of texel `t` inside the slot's block
+static inline float BlockU(const TexSlot* s, int t) {
+    return s ? (float)(t - s->u0) / (float)s->w : t / 256.0f;
+}
+static inline float BlockV(const TexSlot* s, int t) {
+    return s ? (float)(t - s->v0) / (float)s->h : t / 256.0f;
 }
 
 // ===== frame =====
@@ -366,27 +730,39 @@ static bool InitPlatform(void) {
     }
     pvr_set_bg_color(0.0f, 0.0f, 0.0f);
     frame24 = pvr_mem_malloc(FRAME24_W * FRAME24_H * 2);
-    size_t avail = pvr_mem_available();
-    size_t reserve = 256 * 1024;
-    tex_slot_count = avail > reserve ? (int)((avail - reserve) / TEX_BYTES) : 0;
-    if (tex_slot_count > TEX_SLOTS_MAX) {
-        tex_slot_count = TEX_SLOTS_MAX;
-    }
-    for (int i = 0; i < tex_slot_count; i++) {
-        tex_slots[i].ptr = pvr_mem_malloc(TEX_BYTES);
-        if (!tex_slots[i].ptr) {
-            tex_slot_count = i;
-            break;
+    // fill the classes from the largest down while PVR memory lasts
+    size_t reserve = 192 * 1024;
+    int next = 0;
+    for (int c = TEX_CLASSES - 1; c >= 0; c--) {
+        size_t bytes = (size_t)class_texels[c] * 2;
+        class_first[c] = next;
+        class_count[c] = 0;
+        while (class_count[c] < class_max[c] &&
+               pvr_mem_available() > reserve + bytes) {
+            pvr_ptr_t ptr = pvr_mem_malloc(bytes);
+            if (!ptr) {
+                break;
+            }
+            TexSlot* s = &tex_slots[next++];
+            memset(s, 0, sizeof(*s));
+            s->ptr = ptr;
+            s->cls = (uint8_t)c;
+            class_count[c]++;
         }
     }
-    if (tex_slot_count < 4) {
-        WARNF("only %d texture slots in PVR memory", tex_slot_count);
+    tex_slot_count = next;
+    if (!class_count[TEX_CLASSES - 1]) {
+        WARNF("no 256x256 texture slots in PVR memory");
     }
     for (int m = 0; m < BLEND_MODES; m++) {
         CompileHeader(&col_hdr[m], NULL, m);
     }
-    INFOF("PVR: %d texture slots, %u KB free", tex_slot_count,
+    INFOF("PVR: texture slots 1K:%d 4K:%d 16K:%d 32K:%d 64K:%d texels, "
+          "%u KB free",
+          class_count[0], class_count[1], class_count[2], class_count[3],
+          class_count[4],
           (unsigned)(pvr_mem_available() / 1024));
+    stats.start_us = timer_us_gettime64();
     is_init = true;
     return true;
 }
@@ -395,7 +771,9 @@ static void BeginScene(void) {
     if (in_scene) {
         return;
     }
+    uint64_t t0 = timer_us_gettime64();
     pvr_wait_ready(); // the previous frame has finished reading textures
+    stats.pvr_wait_us += timer_us_gettime64() - t0;
     pvr_scene_begin();
     pvr_list_begin(PVR_LIST_TR_POLY);
     in_scene = true;
@@ -416,6 +794,25 @@ static void EndScene(void) {
     pvr_list_finish();
     pvr_scene_finish();
     in_scene = false;
+    stats.vertices += (uint32_t)frame_vertices;
+    if (++stats.frames >= STATS_FRAMES) {
+        uint64_t now = timer_us_gettime64();
+        uint32_t ms = (uint32_t)((now - stats.start_us) / 1000u);
+        INFOF("gpu: %u frames in %u ms (%u.%u fps), %u verts/frame, "
+              "%u decodes (%u Ktexels, %u ms), %u in-frame overwrites; "
+              "waiting for PVR %u ms, idle in vblank %u ms, movie upload "
+              "%u ms",
+              stats.frames, ms, ms ? stats.frames * 1000u / ms : 0,
+              ms ? stats.frames * 10000u / ms % 10 : 0,
+              stats.vertices / stats.frames, stats.decodes,
+              stats.decoded_texels / 1024u,
+              (uint32_t)(stats.decode_us / 1000u), stats.overwrites,
+              (uint32_t)(stats.pvr_wait_us / 1000u),
+              (uint32_t)(stats.vblank_us / 1000u),
+              (uint32_t)(stats.movie_us / 1000u));
+        memset(&stats, 0, sizeof(stats));
+        stats.start_us = now;
+    }
 }
 
 
@@ -430,6 +827,7 @@ static void Present24(void) {
     float top = (float)(game_h > 240 ? disp_top * 2 : disp_top) * scale_y;
     int tex_h = h > 256 ? 512 : 256;
     BeginScene(); // waits for the previous render, which read frame24
+    uint64_t t_movie = timer_us_gettime64();
     for (int y = 0; y < h; y++) {
         const uint8_t* src = (const uint8_t*)&vram[((disp_area.y + y) &
                                                     (VRAM_H - 1)) * VRAM_W];
@@ -444,9 +842,10 @@ static void Present24(void) {
         }
     }
     frame24_dirty = false;
+    stats.movie_us += timer_us_gettime64() - t_movie;
     if (frame24_hdr_h != tex_h) {
         CompileHeaderFmt(&frame24_hdr, frame24, PVR_TXRFMT_RGB565, FRAME24_W,
-                         tex_h, BLEND_OPAQUE);
+                         tex_h, BLEND_OPAQUE, false);
         frame24_hdr_h = tex_h;
     }
     cur_hdr = -100; // a header no cache entry matches
@@ -488,9 +887,11 @@ int Psyz_VideoVSync(int mode) {
     }
     EndScene();
     int count = mode > 1 ? mode : 1;
+    uint64_t t0 = timer_us_gettime64();
     while (count--) {
         vid_waitvbl();
     }
+    stats.vblank_us += timer_us_gettime64() - t0;
     return 0;
 }
 
@@ -617,14 +1018,14 @@ static void EmitRect(int x0, int y0, int x1, int y1, int u0, int v0, int u1,
     TexSlot* t = NULL;
     uint32_t c;
     if (textured) {
-        t = FindTexture(tpage, clut, 0);
+        t = FindTexture(tpage, clut, 0, u0, v0, u1 - 1, v1 - 1);
         c = raw_color ? Argb(255, 255, 255, mode) : TexArgb(r, g, b, mode);
     } else {
         c = Argb(r, g, b, mode);
     }
     float fx0 = MapX(x0), fx1 = MapX(x1), fy0 = MapY(y0), fy1 = MapY(y1);
-    float fu0 = u0 / 256.0f, fu1 = u1 / 256.0f;
-    float fv0 = v0 / 256.0f, fv1 = v1 / 256.0f;
+    float fu0 = BlockU(t, u0), fu1 = BlockU(t, u1);
+    float fv0 = BlockV(t, v0), fv1 = BlockV(t, v1);
     Vtx v[4] = {
         {fx0, fy0, fu0, fv0, c},
         {fx1, fy0, fu1, fv0, c},
@@ -654,14 +1055,17 @@ static void EmitVramRegionQuad(int x, int y, int w, int h) {
                 return;
             }
             u16 tpage = (u16)((page_x >> 6) | ((page_y >> 8) << 4) | (2 << 7));
-            TexSlot* t = FindTexture(tpage, 0, RAW_TEXTURE);
+            int tu0 = px - page_x, tu1 = nx - page_x;
+            int tv0 = py - page_y, tv1 = ny - page_y;
+            TexSlot* t = FindTexture(tpage, 0, RAW_TEXTURE, tu0, tv0, tu1 - 1,
+                                     tv1 - 1);
             uint32_t c = Argb(255, 255, 255, BLEND_OPAQUE);
             float sx0 = (float)(px - fb_origin.x) * scale_x;
             float sx1 = (float)(nx - fb_origin.x) * scale_x;
             float sy0 = FbY(py);
             float sy1 = FbY(ny);
-            float u0 = (px - page_x) / 256.0f, u1 = (nx - page_x) / 256.0f;
-            float v0 = (py - page_y) / 256.0f, v1 = (ny - page_y) / 256.0f;
+            float u0 = BlockU(t, tu0), u1 = BlockU(t, tu1);
+            float v0 = BlockV(t, tv0), v1 = BlockV(t, tv1);
             Vtx v[4] = {
                 {sx0, sy0, u0, v0, c},
                 {sx1, sy0, u1, v0, c},
@@ -733,7 +1137,10 @@ void Draw_Reset(void) {
     memset(vram, 0, sizeof(vram));
     for (int i = 0; i < tex_slot_count; i++) {
         tex_slots[i].valid = false;
+        tex_slots[i].next = NULL;
     }
+    memset(tex_hash, 0, sizeof(tex_hash));
+    memset(page_stats, 0, sizeof(page_stats));
     memo_slot = NULL;
     cur_tpage = 0;
     draw_offset.x = draw_offset.y = 0;
@@ -911,6 +1318,14 @@ void Draw_LoadImage(RECT* rect, u_long* p) {
     if (!ClipRect(rect, &x, &y, &w, &h)) {
         return;
     }
+#ifdef DCGPU_TRACE
+    {
+        extern int g_fake_capture;
+        if (g_fake_capture) {
+            fprintf(stderr, "loadimage %d,%d %dx%d\n", x, y, w, h);
+        }
+    }
+#endif
     const uint16_t* src = (const uint16_t*)p;
     for (int row = 0; row < h; ++row) {
         memcpy(&vram[(y + row) * VRAM_W + x], src + row * rect->w, w * 2);
@@ -1040,11 +1455,35 @@ static void PushPoly(const u_long* p, int code) {
                      ((x[0] > x[2]) ^ (u[0] > u[2]));
         bool fix_v = ((y[0] > y[1]) ^ (v[0] > v[1])) |
                      ((y[0] > y[2]) ^ (v[0] > v[2]));
+        int umin = 1 << 30, umax = -1, vmin = 1 << 30, vmax = -1;
         for (int i = 0; i < n; i++) {
             u[i] += fix_u;
             v[i] += fix_v;
+            umin = u[i] < umin ? u[i] : umin;
+            umax = u[i] > umax ? u[i] : umax;
+            vmin = v[i] < vmin ? v[i] : vmin;
+            vmax = v[i] > vmax ? v[i] : vmax;
         }
-        t = FindTexture(tpage, clut, 0);
+        // PS1 texture coordinates are 8-bit: a box wholly past 255 (the
+        // flip correction on u or v 255) is the start of the page
+        if (umin > 255) {
+            for (int i = 0; i < n; i++) {
+                u[i] -= 256;
+            }
+            umin -= 256;
+            umax -= 256;
+        }
+        if (vmin > 255) {
+            for (int i = 0; i < n; i++) {
+                v[i] -= 256;
+            }
+            vmin -= 256;
+            vmax -= 256;
+        }
+        // texels sampled: [min, max - 1], as the right/bottom edge is not
+        t = FindTexture(tpage, clut, 0, umin, vmin,
+                        umax > umin ? umax - 1 : umax,
+                        vmax > vmin ? vmax - 1 : vmax);
     }
     Vtx out[4];
     for (int i = 0; i < n; i++) {
@@ -1052,8 +1491,8 @@ static void PushPoly(const u_long* p, int code) {
                 b = (uint8_t)(col[i] >> 16);
         out[i].x = MapX(x[i]);
         out[i].y = MapY(y[i]);
-        out[i].u = u[i] / 256.0f;
-        out[i].v = v[i] / 256.0f;
+        out[i].u = BlockU(t, u[i]);
+        out[i].v = BlockV(t, v[i]);
         out[i].argb = !textured ? Argb(r, g, b, mode)
                       : raw     ? Argb(255, 255, 255, mode)
                                 : TexArgb(r, g, b, mode);
