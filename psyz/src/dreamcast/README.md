@@ -30,9 +30,10 @@ the desktop software renderer. Not yet on hardware or in an emulator.
 - **Textures.** A primitive's texels (4, 8 or 16 bpp, plus its CLUT) are
   decoded from that copy into an ARGB1555 block in PVR memory: the
   smallest power-of-two rectangle (16 to 256 a side, starting on a
-  multiple of 16) over its UV box. Pools of 1K, 4K, 16K, 32K and 64K-texel
-  slots fill the PVR memory left beside the framebuffers and the vertex
-  buffers (about 5 MB). A page+CLUT that misses several small blocks in a
+  multiple of 16) over its UV box. Pools of 256, 1K, 4K, 16K, 32K and
+  64K-texel slots fill the PVR memory left beside the framebuffers and the
+  vertex buffers (about 5 MB); the 16x16 pool holds room backgrounds, which
+  are drawn as hundreds of 16x16 tiles, each often with its own CLUT. A page+CLUT that misses several small blocks in a
   frame, such as a model part drawn as many triangles, gets one region
   block over all the UVs drawn with it. A slot tracks the texels actually
   drawn from it, so only writes there make it dirty (page 15 wraps into

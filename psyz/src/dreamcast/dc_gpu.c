@@ -98,20 +98,23 @@ static const uint8_t blend_alpha[BLEND_MODES] = {128, 255, 255, 64, 255, 255};
 // A slot holds one rectangular block of a PS1 texture page, decoded with its
 // CLUT to ARGB1555. Width and height are powers of two from 16 to 256; the
 // block starts on a multiple of 16 texels and wraps inside the page past its
-// edge, as PS1 texture coordinates do. Slots come in five pools by size
-// (1K, 4K, 16K, 32K and 64K texels), so a 16K slot holds 128x128, 256x64
-// or 64x256. A primitive takes the smallest block over its UV box; a page+CLUT
+// edge, as PS1 texture coordinates do. Slots come in six pools by size
+// (256, 1K, 4K, 16K, 32K and 64K texels), so a 16K slot holds 128x128,
+// 256x64 or 64x256. The 16x16 pool is for room backgrounds, drawn as
+// hundreds of 16x16 tiles, often each with its own CLUT. A primitive takes the smallest block over its UV box; a page+CLUT
 // busy with many small blocks in one frame (a model part drawn as many small
 // triangles) gets one region block over everything drawn with it so far,
 // when a slot that size is free this frame.
-#define TEX_CLASSES 5
+#define TEX_CLASSES 6
 #define RAW_TEXTURE 1 // variant: every texel opaque (VRAM region blits)
-static const int class_texels[TEX_CLASSES] = {1024, 4096, 16384, 32768,
-                                              65536};
-// Small blocks are the most numerous: models use many CLUTs and parts.
-static const int class_max[TEX_CLASSES] = {512, 128, 40, 16, 8};
-#define TEX_SLOTS_MAX (512 + 128 + 40 + 16 + 8)
-#define TEX_HASH 1024
+static const int class_texels[TEX_CLASSES] = {256,   1024,  4096,
+                                              16384, 32768, 65536};
+// Small blocks are the most numerous: background tiles, and models with
+// many CLUTs and parts. Pools fill from the largest down, so the 16x16 one
+// takes what PVR memory is left.
+static const int class_max[TEX_CLASSES] = {800, 256, 128, 40, 16, 8};
+#define TEX_SLOTS_MAX (800 + 256 + 128 + 40 + 16 + 8)
+#define TEX_HASH 2048
 #define RETIRED_KEY (UINT64_C(3) << 5) // bpp 3: TexKey never builds it
 
 typedef struct TexSlot {
@@ -221,7 +224,7 @@ static inline uint32_t KeyClut(uint64_t key) { return (uint32_t)(key >> 21); }
 
 static inline unsigned HashKey(uint64_t key) {
     uint32_t k = (uint32_t)key ^ (uint32_t)(key >> 32) * 0x9E3779B1u;
-    return (k * 2654435761u) >> 22; // 10 bits
+    return (k * 2654435761u) >> 21; // 11 bits
 }
 
 static void HashRemove(TexSlot* s) {
@@ -795,10 +798,10 @@ static bool InitPlatform(void) {
     for (int m = 0; m < BLEND_MODES; m++) {
         CompileHeader(&col_hdr[m], NULL, m);
     }
-    INFOF("PVR: texture slots 1K:%d 4K:%d 16K:%d 32K:%d 64K:%d texels, "
-          "%u KB free",
+    INFOF("PVR: texture slots 256:%d 1K:%d 4K:%d 16K:%d 32K:%d 64K:%d "
+          "texels, %u KB free",
           class_count[0], class_count[1], class_count[2], class_count[3],
-          class_count[4],
+          class_count[4], class_count[5],
           (unsigned)(pvr_mem_available() / 1024));
     stats.start_us = timer_us_gettime64();
     is_init = true;
@@ -839,7 +842,7 @@ static void EndScene(void) {
         INFOF("gpu: %u frames in %u ms (%u.%u fps), %u verts/frame, "
               "%u decodes (%u Ktexels, %u ms), %u in-frame overwrites; "
               "waiting for PVR %u ms, idle in vblank %u ms, movie upload "
-              "%u ms; decodes by pool 1K/4K/16K/32K/64K %u/%u/%u/%u/%u, "
+              "%u ms; decodes by pool 256/1K/4K/16K/32K/64K %u/%u/%u/%u/%u/%u, "
               "new/clut/texels/outside %u/%u/%u/%u; VRAM writes %u, "
               "%u changed",
               stats.frames, ms, ms ? stats.frames * 1000u / ms : 0,
@@ -852,8 +855,9 @@ static void EndScene(void) {
               (uint32_t)(stats.movie_us / 1000u),
               stats.class_decodes[0], stats.class_decodes[1],
               stats.class_decodes[2], stats.class_decodes[3],
-              stats.class_decodes[4], stats.why[0], stats.why[1],
-              stats.why[2], stats.why[3], stats.writes, stats.changed);
+              stats.class_decodes[4], stats.class_decodes[5], stats.why[0],
+              stats.why[1], stats.why[2], stats.why[3], stats.writes,
+              stats.changed);
         memset(&stats, 0, sizeof(stats));
         stats.start_us = now;
     }
