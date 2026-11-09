@@ -54,6 +54,13 @@ the desktop software renderer. Not yet on hardware or in an emulator.
   snapping and texture swimming without PGXP's memory and double-precision
   cost; the jitter of the game's 12-bit fixed-point matrices remains. In the
   opening field scenes 86-93% of model polygons are found.
+- **Drawing area.** Primitives are clipped to the drawing area (GP0
+  E3/E4), as the PS1 does; menus draw models and scrolling lists in a
+  window this way. A primitive wholly inside is sent as it is, one across
+  the edge is clipped on the CPU. Fills and uploads ignore the area.
+- **Texture windows** (GP0 E2) that repeat a tile, the usual kind, take a
+  block of one period (at least 16 texels, the tile repeating inside it)
+  that the PVR repeats; dialog boxes fill with a 32x32 tile this way.
 - **Transparency.** Colour 0 is transparent. Semi-transparency modes 0
   (B/2+F/2), 1 (B+F) and 3 (B+F/4) use PVR blending with vertex alpha.
   Mode 2 (B-F) has no PVR blend, so the primitive is drawn three times:
@@ -120,8 +127,7 @@ per second. `hosttest/mdec_check.sh` checks the output against the
 original decoder on random streams.
 
 Not emulated yet: drawing into VRAM and sampling it back as a texture,
-reading rendered pixels back, the draw-area clip, texture windows, mask
-bits, dithering, per-texel STP on semi-transparent primitives (the whole
+reading rendered pixels back, mask bits, dithering, per-texel STP on semi-transparent primitives (the whole
 primitive blends), and textured colours above 0x80 (the PVR modulates up to
 1.0, the PS1 up to 2.0).
 

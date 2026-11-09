@@ -133,6 +133,7 @@ typedef struct TexSlot {
     // reaches past the used box
     int16_t used_u0, used_v0, used_u1, used_v1;
     uint8_t cls;
+    uint8_t wrap_u, wrap_v; // texture window period - 1 (255: none)
     uint8_t hdr_mode; // blend mode * 2 + filter of hdr
     uint8_t dirty_why; // DIRTY_*: why it is decoded next (statistics)
     bool valid;
@@ -148,6 +149,9 @@ enum { DIRTY_NEW, DIRTY_CLUT, DIRTY_TEXELS, DIRTY_OUTSIDE, DIRTY_REASONS };
 typedef struct {
     int cls;
     int u0, v0, w, h;
+    // texture window: log2 of the repeat period along u / v (0: none); the
+    // block is then one period, drawn repeating
+    int wu, wv;
 } Block;
 
 static TexSlot tex_slots[TEX_SLOTS_MAX];
@@ -222,10 +226,13 @@ static inline uint64_t TexKey(u16 tpage, u16 clut, int variant,
                    ((uint64_t)(b->u0 >> 4) << 13) |
                    ((uint64_t)(b->v0 >> 4) << 17);
     key |= bpp < 2 ? (uint64_t)(clut & 0x7FFF) << 21 : (uint64_t)variant << 21;
+    key |= (uint64_t)b->wu << 36 | (uint64_t)b->wv << 39;
     return key;
 }
 
-static inline uint32_t KeyClut(uint64_t key) { return (uint32_t)(key >> 21); }
+static inline uint32_t KeyClut(uint64_t key) {
+    return (uint32_t)(key >> 21) & 0x7FFF;
+}
 
 static inline unsigned HashKey(uint64_t key) {
     uint32_t k = (uint32_t)key ^ (uint32_t)(key >> 32) * 0x9E3779B1u;
@@ -359,12 +366,16 @@ static void DecodeSlot(TexSlot* s) {
     int raw = bpp == 2 ? (int)KeyClut(key) & 1 : 0;
     int w = s->w, h = s->h;
     uint32_t* dst = (uint32_t*)s->ptr;
+    // a texture window narrower than the block repeats inside it
+    int wu = s->wrap_u, wv = s->wrap_v;
     if (bpp == 2) {
         for (int v = 0; v < h; v++) {
             const uint16_t* row =
-                &vram[((page_y + ((s->v0 + v) & 255)) & (VRAM_H - 1)) * VRAM_W];
+                &vram[((page_y + ((s->v0 + (v & wv)) & 255)) & (VRAM_H - 1)) *
+                      VRAM_W];
             for (int u = 0; u < w; u += 2) {
-                int ua = (s->u0 + u) & 255, ub = (s->u0 + u + 1) & 255;
+                int ua = (s->u0 + (u & wu)) & 255;
+                int ub = (s->u0 + ((u + 1) & wu)) & 255;
                 uint16_t a = Convert(row[(page_x + ua) & (VRAM_W - 1)], raw);
                 uint16_t b = Convert(row[(page_x + ub) & (VRAM_W - 1)], raw);
                 *dst++ = a | ((uint32_t)b << 16);
@@ -383,12 +394,14 @@ static void DecodeSlot(TexSlot* s) {
         int halfwords = bpp ? w / 2 : w / 4;
         int page_halfwords = bpp ? 128 : 64;
         int h0 = bpp ? s->u0 / 2 : s->u0 / 4;
+        int hw = bpp ? wu >> 1 : wu >> 2; // halfwords of the window period
         for (int v = 0; v < h; v++) {
             const uint16_t* row =
-                &vram[((page_y + ((s->v0 + v) & 255)) & (VRAM_H - 1)) * VRAM_W];
+                &vram[((page_y + ((s->v0 + (v & wv)) & 255)) & (VRAM_H - 1)) *
+                      VRAM_W];
             if (bpp == 0) {
                 for (int i = 0; i < halfwords; i++) {
-                    int hx = page_x + ((h0 + i) & (page_halfwords - 1));
+                    int hx = page_x + ((h0 + (i & hw)) & (page_halfwords - 1));
                     uint16_t px = row[hx & (VRAM_W - 1)];
                     *dst++ = pal[px & 0xF] |
                              ((uint32_t)pal[(px >> 4) & 0xF] << 16);
@@ -397,7 +410,7 @@ static void DecodeSlot(TexSlot* s) {
                 }
             } else {
                 for (int i = 0; i < halfwords; i++) {
-                    int hx = page_x + ((h0 + i) & (page_halfwords - 1));
+                    int hx = page_x + ((h0 + (i & hw)) & (page_halfwords - 1));
                     uint16_t px = row[hx & (VRAM_W - 1)];
                     *dst++ = pal[px & 0xFF] | ((uint32_t)pal[px >> 8] << 16);
                 }
@@ -493,6 +506,8 @@ static TexSlot* UseSlot(TexSlot* s, uint64_t key, const Block* b) {
         s->v0 = (uint16_t)b->v0;
         s->w = (uint16_t)b->w;
         s->h = (uint16_t)b->h;
+        s->wrap_u = (uint8_t)(b->wu ? (1 << b->wu) - 1 : 255);
+        s->wrap_v = (uint8_t)(b->wv ? (1 << b->wv) - 1 : 255);
         s->hdr_mode = HDR_NONE;
         HashInsert(s);
     }
@@ -545,7 +560,7 @@ static TexSlot* GetBlock(u16 tpage, u16 clut, int variant, const Block* b,
     return UseSlot(s, key, b);
 }
 
-static const Block whole_page = {TEX_CLASSES - 1, 0, 0, 256, 256};
+static const Block whole_page = {TEX_CLASSES - 1, 0, 0, 256, 256, 0, 0};
 
 // The smallest block of pool `min_cls` or larger holding texels
 // [umin, umax] x [vmin, vmax]; the whole page if nothing smaller does.
@@ -555,6 +570,7 @@ static Block ChooseBlock(int umin, int vmin, int umax, int vmax, int min_cls) {
         return whole_page;
     }
     Block b;
+    b.wu = b.wv = 0;
     b.u0 = umin & ~15;
     b.v0 = vmin & ~15;
     b.w = 1 << Log2(umax - b.u0 + 1);
@@ -579,12 +595,87 @@ static Block ChooseBlock(int umin, int vmin, int umax, int vmax, int min_cls) {
     return whole_page;
 }
 
+// Texture window (GP0 E2): u becomes (u & ~mask) | (offset & mask). A mask
+// of the top bits (the usual case) repeats a tile of 2^log2 texels at the
+// offset; log2 0 is no window on that axis.
+static struct {
+    int log2_u, log2_v;
+    int off_u, off_v;
+} tex_window;
+
+// one window axis from its GP0 mask and offset (in 8-texel units)
+static void SetWindowAxis(unsigned mask, unsigned off, int* log2, int* origin) {
+    int m = (int)(mask & 0x1F) * 8;
+    *log2 = 0;
+    *origin = 0;
+    if (!m) {
+        return;
+    }
+    int period = m & -m;
+    if ((m | (period - 1)) != 0xFF) {
+        LOG_ONCE("texture window with a mask that is not a repeat");
+        return;
+    }
+    *log2 = Log2(period);
+    *origin = (int)(off & mask & 0x1F) * 8;
+}
+
+static TexSlot* GetBlock(u16 tpage, u16 clut, int variant, const Block* b,
+                         bool force);
+
+// The block for a primitive under a texture window: one period along each
+// windowed axis (at least 16 texels, the period repeating inside), the
+// texels drawn along the others.
+static TexSlot* FindWindowTexture(u16 tpage, u16 clut, int umin, int vmin,
+                                  int umax, int vmax) {
+    Block b;
+    b.wu = tex_window.log2_u;
+    b.wv = tex_window.log2_v;
+    if (b.wu) {
+        b.u0 = tex_window.off_u;
+        b.w = b.wu < 4 ? 16 : 1 << b.wu;
+    } else if (umin < 0 || umax > 255) {
+        b.u0 = 0;
+        b.w = 256;
+    } else {
+        b.u0 = umin & ~15;
+        b.w = 1 << Log2(umax - b.u0 + 1);
+        b.w = b.w < 16 ? 16 : b.w;
+    }
+    if (b.wv) {
+        b.v0 = tex_window.off_v;
+        b.h = b.wv < 4 ? 16 : 1 << b.wv;
+    } else if (vmin < 0 || vmax > 255) {
+        b.v0 = 0;
+        b.h = 256;
+    } else {
+        b.v0 = vmin & ~15;
+        b.h = 1 << Log2(vmax - b.v0 + 1);
+        b.h = b.h < 16 ? 16 : b.h;
+    }
+    for (b.cls = 0; b.cls < TEX_CLASSES - 1; b.cls++) {
+        if (class_count[b.cls] && b.w * b.h <= class_texels[b.cls]) {
+            break;
+        }
+    }
+    req_u0 = b.u0;
+    req_v0 = b.v0;
+    req_u1 = b.u0 + (b.wu ? (1 << b.wu) : b.w) - 1;
+    req_v1 = b.v0 + (b.wv ? (1 << b.wv) : b.h) - 1;
+    req_u1 = req_u1 > 255 ? 255 : req_u1;
+    req_v1 = req_v1 > 255 ? 255 : req_v1;
+    return GetBlock(tpage, clut, 0, &b, true);
+}
+
 // The block of texture page `tpage` (CLUT `clut`) holding texels
 // [umin, umax] x [vmin, vmax]: the page+CLUT's region block when it has one
 // that holds the box, otherwise the smallest block that does. A box past
 // the page edge takes the whole page, which repeats.
 static TexSlot* FindTexture(u16 tpage, u16 clut, int variant, int umin,
                             int vmin, int umax, int vmax) {
+    if (variant == 0 && (tex_window.log2_u || tex_window.log2_v)) {
+        return FindWindowTexture(tpage, clut, umin, vmin, umax, vmax);
+    }
     // texels read, clamped to the page; a box past the edge repeats the
     // page, so it reads all of it
     if (umin < 0 || vmin < 0 || umax > 255 || vmax > 255) {
@@ -745,19 +836,30 @@ static void SendHeader(TexSlot* t, int mode, bool filter) {
     // compiling a header costs more than sending it: keep the slot's last
     int hdr_mode = mode * 2 + filter;
     if (t->hdr_mode != hdr_mode) {
+        // a texture window repeats its block; other blocks clamp
+        bool clamp = (t->w < 256 || t->h < 256) && t->wrap_u == 255 &&
+                     t->wrap_v == 255;
         CompileHeaderFmt(&t->hdr, t->ptr, PVR_TXRFMT_ARGB1555, t->w, t->h,
-                         mode, t->w < 256 || t->h < 256, filter);
+                         mode, clamp, filter);
         t->hdr_mode = (uint8_t)hdr_mode;
     }
     pvr_prim(&t->hdr, sizeof(t->hdr));
 }
 
 // texture coordinate of texel `t` inside the slot's block
+// (a texture window's block repeats: any whole number of periods maps to
+// its origin)
 static inline float BlockU(const TexSlot* s, int t) {
-    return s ? (float)(t - s->u0) / (float)s->w : t / 256.0f;
+    if (!s) {
+        return t / 256.0f;
+    }
+    return (float)(s->wrap_u != 255 ? t : t - s->u0) / (float)s->w;
 }
 static inline float BlockV(const TexSlot* s, int t) {
-    return s ? (float)(t - s->v0) / (float)s->h : t / 256.0f;
+    if (!s) {
+        return t / 256.0f;
+    }
+    return (float)(s->wrap_v != 255 ? t : t - s->v0) / (float)s->h;
 }
 
 // ===== frame =====
@@ -1064,9 +1166,112 @@ static void SubmitVertices(const Vtx* v, int n, bool white) {
     }
 }
 
+// ----- drawing-area clip -----
+// The PS1 draws primitives only inside the drawing area (GP0 E3/E4); games
+// set it to a window to clip what they draw there. Fills and uploads ignore
+// it.
+static bool clip_to_area;
+
+static inline Vtx Lerp(const Vtx* a, const Vtx* b, float t) {
+    Vtx r;
+    r.x = a->x + (b->x - a->x) * t;
+    r.y = a->y + (b->y - a->y) * t;
+    r.u = a->u + (b->u - a->u) * t;
+    r.v = a->v + (b->v - a->v) * t;
+    r.z = a->z + (b->z - a->z) * t;
+    uint32_t c = 0;
+    for (int sh = 0; sh < 32; sh += 8) {
+        float ca = (float)((a->argb >> sh) & 0xFF);
+        float cb = (float)((b->argb >> sh) & 0xFF);
+        c |= (uint32_t)(int)(ca + (cb - ca) * t + 0.5f) << sh;
+    }
+    r.argb = c;
+    return r;
+}
+
+// keeps the side of the line `coord` = `limit` where `keep_below` says
+static int ClipEdge(const Vtx* in, int n, Vtx* out, bool on_x, float limit,
+                    bool keep_below) {
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        const Vtx* a = &in[i];
+        const Vtx* b = &in[(i + 1) % n];
+        float ca = on_x ? a->x : a->y, cb = on_x ? b->x : b->y;
+        bool ia = keep_below ? ca <= limit : ca >= limit;
+        bool ib = keep_below ? cb <= limit : cb >= limit;
+        if (ia) {
+            out[m++] = *a;
+        }
+        if (ia != ib) {
+            out[m++] = Lerp(a, b, (limit - ca) / (cb - ca));
+        }
+    }
+    return m;
+}
+
+// The part of strip `v` inside the drawing area, in strip order in `out`:
+// returns its vertex count (0: nothing left), or -1 when all of it is inside
+static int ClipToArea(const Vtx* v, int n, Vtx* out) {
+    float x0 = (float)(draw_area_start.x - fb_origin.x) * scale_x;
+    float x1 = (float)(draw_area_end.x + 1 - fb_origin.x) * scale_x;
+    float y0 = FbY(draw_area_start.y), y1 = FbY(draw_area_end.y + 1);
+    float bx0 = v[0].x, bx1 = v[0].x, by0 = v[0].y, by1 = v[0].y;
+    for (int i = 1; i < n; i++) {
+        bx0 = v[i].x < bx0 ? v[i].x : bx0;
+        bx1 = v[i].x > bx1 ? v[i].x : bx1;
+        by0 = v[i].y < by0 ? v[i].y : by0;
+        by1 = v[i].y > by1 ? v[i].y : by1;
+    }
+    if (bx0 >= x0 && bx1 <= x1 && by0 >= y0 && by1 <= y1) {
+        return -1;
+    }
+    if (bx1 <= x0 || bx0 >= x1 || by1 <= y0 || by0 >= y1) {
+        return 0;
+    }
+    Vtx a[12], b[12];
+    // strip order to polygon order
+    a[0] = v[0];
+    a[1] = v[1];
+    if (n == 4) {
+        a[2] = v[3];
+        a[3] = v[2];
+    } else {
+        a[2] = v[2];
+    }
+    int m = ClipEdge(a, n, b, true, x0, false);
+    m = ClipEdge(b, m, a, true, x1, true);
+    m = ClipEdge(a, m, b, false, y0, false);
+    m = ClipEdge(b, m, a, false, y1, true);
+    if (m < 3) {
+        return 0;
+    }
+    // polygon to strip: zigzag from both ends
+    int lo = 1, hi = m - 1, k = 0;
+    out[k++] = a[0];
+    while (lo <= hi) {
+        out[k++] = a[lo++];
+        if (lo <= hi) {
+            out[k++] = a[hi--];
+        }
+    }
+    return k;
+}
+
 // n vertices in triangle-strip order
 static void SubmitStrip(const Vtx* v, int n, TexSlot* t, int mode,
                         bool filter) {
+    Vtx clipped[12];
+    if (clip_to_area) {
+        int k = ClipToArea(v, n, clipped);
+        if (k == 0) {
+            return;
+        }
+        if (k > 0) {
+            frame_vertices += k - n;
+            v = clipped;
+            n = k;
+        }
+    }
     if (mode != 2) {
         SendHeader(t, mode, filter);
         SubmitVertices(v, n, false);
@@ -1337,9 +1542,8 @@ void Draw_SetTexpageMode(ParamDrawTexpageMode* p) {
 
 void Draw_SetTextureWindow(unsigned int mask_x, unsigned int mask_y,
                            unsigned int off_x, unsigned int off_y) {
-    if (off_x || off_y || mask_x != 0xFFFFFFFF || mask_y != 0xFFFFFFFF) {
-        LOG_ONCE("texture windows not supported");
-    }
+    SetWindowAxis(mask_x, off_x, &tex_window.log2_u, &tex_window.off_u);
+    SetWindowAxis(mask_y, off_y, &tex_window.log2_v, &tex_window.off_v);
 }
 
 void Draw_SetAreaStart(int x, int y) {
@@ -1399,20 +1603,24 @@ void Draw_ClearImage(RECT* rect, u_char r, u_char g, u_char b) {
         return;
     }
     uint16_t c = (uint16_t)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
-    // games clear the same area every frame; with no VRAM change since the
-    // last such clear, it already holds the colour
+    // games clear the same areas (both framebuffers, in turn) every frame;
+    // with no VRAM change since such a clear, the area holds the colour
+    enum { CLEARS = 4 };
     static struct {
         int x, y, w, h;
         uint16_t c;
         uint32_t epoch;
         bool valid;
-    } last_clear;
-    if (last_clear.valid && last_clear.epoch == vram_epoch &&
-        last_clear.x == x && last_clear.y == y && last_clear.w == w &&
-        last_clear.h == h && last_clear.c == c) {
-        stats.writes++;
-        EmitFill(x, y, w, h, r, g, b);
-        return;
+    } clears[CLEARS];
+    static int next_clear;
+    for (int i = 0; i < CLEARS; i++) {
+        if (clears[i].valid && clears[i].epoch == vram_epoch &&
+            clears[i].x == x && clears[i].y == y && clears[i].w == w &&
+            clears[i].h == h && clears[i].c == c) {
+            stats.writes++;
+            EmitFill(x, y, w, h, r, g, b);
+            return;
+        }
     }
     int first = h, last = -1;
     for (int row = 0; row < h; ++row) {
@@ -1426,13 +1634,15 @@ void Draw_ClearImage(RECT* rect, u_char r, u_char g, u_char b) {
         }
     }
     InvalidateChanged(x, y, w, first, last);
-    last_clear.x = x;
-    last_clear.y = y;
-    last_clear.w = w;
-    last_clear.h = h;
-    last_clear.c = c;
-    last_clear.epoch = vram_epoch;
-    last_clear.valid = true;
+    // a change made clears remembered before it stale; this one stands
+    clears[next_clear].x = x;
+    clears[next_clear].y = y;
+    clears[next_clear].w = w;
+    clears[next_clear].h = h;
+    clears[next_clear].c = c;
+    clears[next_clear].epoch = vram_epoch;
+    clears[next_clear].valid = true;
+    next_clear = (next_clear + 1) % CLEARS;
     EmitFill(x, y, w, h, r, g, b);
 }
 
@@ -1747,6 +1957,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     if (len < need || max_len <= 0) {
         return len; // truncated packet
     }
+    clip_to_area = true;
     if (code >= 0x20 && code < 0x40) {
         PushPoly(packets, code);
     } else if (code >= 0x40 && code < 0x60) {
@@ -1754,6 +1965,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
     } else if (code >= 0x60 && code < 0x80) {
         PushRect(packets, code);
     }
+    clip_to_area = false;
     return len;
 }
 
