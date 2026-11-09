@@ -156,6 +156,11 @@ int Psyz_GtePgxpNclip4(
     const void* s2, unsigned int xy2, const void* s3, unsigned int xy3,
     int int_area);
 
+#ifdef __psyz
+// inline access for constant registers and commands
+#include <psyz/gte_state.h>
+#endif
+
 #ifdef __cplusplus
 }
 #endif

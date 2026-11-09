@@ -1,3 +1,4 @@
+#define PSYZ_GTE_NO_INLINE // declares the GTE entry points itself
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>

@@ -29,62 +29,11 @@
 #define GTE_64BIT
 #endif
 
-// Names from https://www.problemkaputt.de/psx-spx.htm#gteoverview
-#define GTE_REGS(R)                                                            \
-    R(SVECTOR, v0)         /* cop1 0-1 */                                      \
-    R(SVECTOR, v1)         /* cop1 2-3 */                                      \
-    R(SVECTOR, v2)         /* cop1 4-5 */                                      \
-    R(CVECTOR, rgbc)       /* cop1 6 */                                        \
-    R(unsigned short, otz) /* cop1 7 average Z value */                        \
-    R(short, ir0)          /* cop1 8 accumulator, interpolate */               \
-    R(short, ir1)          /* cop1 9 accumulator, vector x */                  \
-    R(short, ir2)          /* cop1 10 accumulator, vector y */                 \
-    R(short, ir3)          /* cop1 11 accumulator, vector z */                 \
-    R(short, sx0)          /* cop1 12-14 screen XY FIFO */                     \
-    R(short, sy0)                                                              \
-    R(short, sx1)                                                              \
-    R(short, sy1)                                                              \
-    R(short, sx2)                                                              \
-    R(short, sy2)                                                              \
-    R(short, sxp) /* cop1 15 */                                                \
-    R(short, syp)                                                              \
-    R(unsigned short, sz0) /* cop1 16-19 screen Z FIFO */                      \
-    R(unsigned short, sz1)                                                     \
-    R(unsigned short, sz2)                                                     \
-    R(unsigned short, sz3)                                                     \
-    R(int, mac0)          /* cop1 24 math accumulator (value) */               \
-    R(int, mac1)          /* cop1 25 math accumulator (vector) */              \
-    R(int, mac2)          /* cop1 26 math accumulator (vector) */              \
-    R(int, mac3)          /* cop1 27 math accumulator (vector) */              \
-    R(unsigned int, rgb0) /* cop1 20 color FIFO */                             \
-    R(unsigned int, rgb1) /* cop1 21 */                                        \
-    R(unsigned int, rgb2) /* cop1 22 */                                        \
-    R(unsigned int, res1) /* cop1 23 (reserved) */                             \
-    R(unsigned int, lzcs) /* cop1 30 leading sign source */                    \
-    R(unsigned int, lzcr) /* cop1 31 leading sign count */                     \
-    R(MATRIX, m)          /* cop2 0-7, rotation 3x3 + translation */           \
-    R(MATRIX, l1)         /* cop2 8-15 light source 3x3 + bg color */          \
-    R(MATRIX, l2)         /* cop2 16-23 light source 3x3 + bg color */         \
-    R(int, ofx)           /* cop2 24 screen offset X */                        \
-    R(int, ofy)           /* cop2 25 screen offset Y */                        \
-    R(unsigned short, h)  /* cop2 26 projection plane distance */              \
-    R(short, dqa)         /* cop2 27 depth queing parameter A (coeff) */       \
-    R(int, dqb)           /* cop2 28 depth queing parameter B (s32) */         \
-    R(short, zsf3)        /* cop2 29 average Z scale factor */                 \
-    R(short, zsf4)        /* cop2 30 average Z scale factor */                 \
-    R(unsigned int, flag) /* cop2 31 */
-
-#ifdef GTE_64BIT
-#define GTE_REG(type, name) static type gte_##name;
-GTE_REGS(GTE_REG)
-#define GTE(name) gte_##name
-#else
-#define GTE_REG(type, name) type name;
-static struct {
-    GTE_REGS(GTE_REG)
-} gte;
-#define GTE(name) gte.name
-#endif
+// The registers (psyz/gte_state.h) are one global struct, so that the
+// header's inline accessors reach them from the game's code.
+#define PSYZ_GTE_IMPL
+PsyzGteRegs psyz_gte;
+#define GTE(name) psyz_gte.name
 
 #define V0 GTE(v0)
 #define V1 GTE(v1)
@@ -1649,7 +1598,24 @@ static const unsigned char unr_table[257] = {
 // The helpers below are macros so that -O0 builds inline them too.
 // The keyword `inline` is a compiler hint, and doesn't guarantee inlining.
 
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(__sh__)
+// The SH-4 has no count-leading-zeros instruction: __builtin_clz is a
+// library call. A table of the leading zeros of a byte does it inline.
+static const unsigned char clz8_table[256] = {
+#define CLZ8_4(n) n, n, n, n
+#define CLZ8_16(n) CLZ8_4(n), CLZ8_4(n), CLZ8_4(n), CLZ8_4(n)
+    8, 7, 6, 6, CLZ8_4(5), CLZ8_4(4), CLZ8_4(4), CLZ8_16(3),
+    CLZ8_16(2), CLZ8_16(2), CLZ8_16(1), CLZ8_16(1), CLZ8_16(1), CLZ8_16(1),
+    CLZ8_16(0), CLZ8_16(0), CLZ8_16(0), CLZ8_16(0), CLZ8_16(0), CLZ8_16(0),
+    CLZ8_16(0), CLZ8_16(0),
+#undef CLZ8_16
+#undef CLZ8_4
+};
+// leading zeros of a 16-bit value (16 for 0)
+#define CLZ16(x)                                                               \
+    ((unsigned)(x) >> 8 ? (unsigned)clz8_table[(unsigned)(x) >> 8]             \
+                        : 8u + clz8_table[(unsigned)(x) & 0xFF])
+#elif defined(__GNUC__) || defined(__clang__)
 // Unix compilers use the highly performant byte code clz to count bits.
 #define CLZ16(x) ((unsigned)__builtin_clz((unsigned)(x)) - 16u)
 #else
@@ -3581,7 +3547,7 @@ static void unpack_xy(unsigned int v, short* x, short* y) {
     *y = (short)((v >> 16) & 0xFFFF);
 }
 
-unsigned int Psyz_GteDataRead(unsigned idx) {
+unsigned int (Psyz_GteDataRead)(unsigned idx) {
     switch (idx) {
     case 0:
         return ((unsigned int)(u16)V0.vx) | (((unsigned int)(u16)V0.vy) << 16);
@@ -3677,7 +3643,7 @@ void Psyz_GteStoreSxyTo(unsigned reg, void* dst) {
     }
 }
 
-void Psyz_GteDataWrite(unsigned idx, unsigned int v) {
+void (Psyz_GteDataWrite)(unsigned idx, unsigned int v) {
     switch (idx) {
     case 0:
         V0.vx = (short)(v & 0xFFFF);
@@ -3865,7 +3831,7 @@ unsigned int Psyz_GteCtrlRead(unsigned idx) {
     }
 }
 
-void Psyz_GteCtrlWrite(unsigned idx, unsigned int v) {
+void (Psyz_GteCtrlWrite)(unsigned idx, unsigned int v) {
     switch (idx) {
     case 0:
         M.m[0][0] = (short)(v & 0xFFFF);
@@ -4002,7 +3968,7 @@ static void (*const gte_ops[64])(unsigned int cmd) = {
     NOOP, NOOP,  NOOP,  NOOP, NOOP, GPF,       GPL,       NCCT, // 38-3F
 };
 
-void Psyz_GteCommand(unsigned int cmd) { gte_ops[cmd & 0x3F](cmd); }
+void (Psyz_GteCommand)(unsigned int cmd) { gte_ops[cmd & 0x3F](cmd); }
 
 /* Explicit numeric GTE component. Stable endian scalar encoding, no pointers. */
 #include <psyz/state_numeric.h>

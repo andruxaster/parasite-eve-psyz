@@ -67,6 +67,12 @@ the desktop software renderer. Not yet on hardware or in an emulator.
 - **Texture windows** (GP0 E2) that repeat a tile, the usual kind, take a
   block of one period (at least 16 texels, the tile repeating inside it)
   that the PVR repeats; dialog boxes fill with a 32x32 tile this way.
+- **GTE.** The registers are one global struct (`psyz/gte_state.h`); a
+  register or command given as a constant, as games almost always do,
+  compiles to plain loads and stores and a direct call (RTPS, RTPT, NCLIP,
+  AVSZ3/4, MVMVA rt*v0+tr) instead of a call into libgte.c's switch. The
+  divider counts leading zeros with a table: the SH-4 has no instruction
+  for it, and `__builtin_clz` was a library call per vertex.
 - **Transparency.** Colour 0 is transparent. Semi-transparency modes 0
   (B/2+F/2), 1 (B+F) and 3 (B+F/4) use PVR blending with vertex alpha.
   Mode 2 (B-F) has no PVR blend, so the primitive is drawn three times:
