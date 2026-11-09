@@ -701,13 +701,38 @@ static struct {
     uint8_t variant;
 } find_cache[FIND_CACHE];
 
+// the block found last: primitives come in runs of one texture (a model's
+// material, a background's tiles), so most find it again without hashing
+static struct {
+    TexSlot* slot;
+    uint64_t key;
+    u16 tpage, clut;
+    uint8_t variant;
+} find_last;
+
 static TexSlot* FindTexture(u16 tpage, u16 clut, int variant, int umin,
                             int vmin, int umax, int vmax) {
+    TexSlot* s = find_last.slot;
+    if (s && find_last.tpage == tpage && find_last.clut == clut &&
+        find_last.variant == variant && s->key == find_last.key && s->valid &&
+        !s->dirty && !(tex_window.log2_u | tex_window.log2_v) &&
+        umin >= s->used_u0 && vmin >= s->used_v0 && umax <= s->used_u1 &&
+        vmax <= s->used_v1) {
+        req_u0 = umin;
+        req_v0 = vmin;
+        req_u1 = umax;
+        req_v1 = vmax;
+        if (s->used_frame != frame_no) {
+            s->used_frame = frame_no;
+            s->last_used = ++tex_clock;
+        }
+        return s;
+    }
     unsigned cell = (unsigned)(umin >> 4 & 15) | (unsigned)(vmin >> 4 & 15) << 4;
     unsigned h = ((unsigned)clut * 0x9E3779B1u ^ (unsigned)tpage * 0x85EBCA6Bu ^
                   cell * 0xC2B2AE35u ^ (unsigned)variant) >>
                  22;
-    TexSlot* s = find_cache[h].slot;
+    s = find_cache[h].slot;
     if (s && find_cache[h].tpage == tpage && find_cache[h].clut == clut &&
         find_cache[h].cell == cell && find_cache[h].variant == variant &&
         s->key == find_cache[h].key &&
@@ -722,7 +747,7 @@ static TexSlot* FindTexture(u16 tpage, u16 clut, int variant, int umin,
             s->used_frame = frame_no;
             s->last_used = ++tex_clock;
         }
-        return s;
+        goto found;
     }
     s = FindTextureSlow(tpage, clut, variant, umin, vmin, umax, vmax);
     find_cache[h].slot = s;
@@ -731,6 +756,12 @@ static TexSlot* FindTexture(u16 tpage, u16 clut, int variant, int umin,
     find_cache[h].clut = clut;
     find_cache[h].cell = (uint16_t)cell;
     find_cache[h].variant = (uint8_t)variant;
+found:
+    find_last.slot = s;
+    find_last.key = s ? s->key : 0;
+    find_last.tpage = tpage;
+    find_last.clut = clut;
+    find_last.variant = (uint8_t)variant;
     return s;
 }
 
@@ -1395,6 +1426,39 @@ static int ClipToArea(const Vtx* v, int n, Vtx* out) {
     return k;
 }
 
+// Where a box of PS1 draw coordinates (vertices, before the offset) lies
+// against the drawing area: 1 wholly inside, 0 wholly outside, -1 across
+// its edge. The same answer as ClipToArea's test on screen coordinates,
+// which are these plus whole numbers, times the scale.
+static inline int AreaTest(int x0, int y0, int x1, int y1) {
+    int sx = draw_area_start.x - draw_offset.x;
+    int sy = draw_area_start.y - draw_offset.y;
+    int ex = draw_area_end.x + 1 - draw_offset.x;
+    int ey = draw_area_end.y + 1 - draw_offset.y;
+    if (x0 >= sx && x1 <= ex && y0 >= sy && y1 <= ey) {
+        return 1;
+    }
+    if (x1 <= sx || x0 >= ex || y1 <= sy || y0 >= ey) {
+        return 0;
+    }
+    return -1;
+}
+
+// one vertex straight to the TA, as SubmitVertices writes it
+static inline void EmitVertex(float x, float y, float u, float v,
+                              uint32_t argb, bool last) {
+    pvr_vertex_t* o = pvr_dr_target();
+    o->flags = last ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+    o->x = x;
+    o->y = y;
+    o->z = 1.0f;
+    o->u = u;
+    o->v = v;
+    o->argb = argb;
+    o->oargb = 0;
+    pvr_dr_commit(o);
+}
+
 // n vertices in triangle-strip order
 static void SubmitStrip(const Vtx* v, int n, TexSlot* t, int mode,
                         bool filter) {
@@ -1464,6 +1528,18 @@ static void EmitRect(int x0, int y0, int x1, int y1, int u0, int v0, int u1,
     float fx0 = MapX(x0), fx1 = MapX(x1), fy0 = MapY(y0), fy1 = MapY(y1);
     float fu0 = BlockU(t, u0), fu1 = BlockU(t, u1);
     float fv0 = BlockV(t, v0), fv1 = BlockV(t, v1);
+    int area = clip_to_area ? AreaTest(x0, y0, x1, y1) : 1;
+    if (area == 0) {
+        return;
+    }
+    if (area > 0 && mode != 2) {
+        SendHeader(t, mode, false);
+        EmitVertex(fx0, fy0, fu0, fv0, c, false);
+        EmitVertex(fx1, fy0, fu1, fv0, c, false);
+        EmitVertex(fx0, fy1, fu0, fv1, c, false);
+        EmitVertex(fx1, fy1, fu1, fv1, c, true);
+        return;
+    }
     Vtx v[4] = {
         {fx0, fy0, fu0, fv0, c},
         {fx1, fy0, fu1, fv0, c},
@@ -1905,6 +1981,7 @@ static void PushPoly(const u_long* p, int code) {
     int x[4], y[4], u[4] = {0}, v[4] = {0};
     const u_long* xy_word[4];
     uint32_t col[4];
+    int xmin = 1 << 30, xmax = -(1 << 30), ymin = 1 << 30, ymax = -(1 << 30);
     u16 clut = 0, tpage = cur_tpage;
     const u_long* w = p;
     col[0] = (uint32_t)*w++;
@@ -1916,6 +1993,10 @@ static void PushPoly(const u_long* p, int code) {
         uint32_t xy = (uint32_t)*w++;
         x[i] = s11(xy);
         y[i] = s11(xy >> 16);
+        xmin = x[i] < xmin ? x[i] : xmin;
+        xmax = x[i] > xmax ? x[i] : xmax;
+        ymin = y[i] < ymin ? y[i] : ymin;
+        ymax = y[i] > ymax ? y[i] : ymax;
         if (textured) {
             uint32_t uv = (uint32_t)*w++;
             u[i] = uv & 0xFF;
@@ -1925,11 +2006,6 @@ static void PushPoly(const u_long* p, int code) {
             } else if (i == 1) {
                 tpage = (u16)(uv >> 16);
             }
-        }
-    }
-    if (!gouraud || raw) {
-        for (int i = 1; i < n; i++) {
-            col[i] = col[0];
         }
     }
     int mode = BlendMode(semitrans, tpage);
@@ -1973,18 +2049,50 @@ static void PushPoly(const u_long* p, int code) {
                         umax > umin ? umax - 1 : umax,
                         vmax > vmin ? vmax - 1 : vmax);
     }
-    Vtx out[4];
     stats.polys++;
-    (void)xy_word; // read only with PSYZ_GTE_SUBPIXEL
+    uint32_t argb[4];
+    if (!gouraud || raw) { // one colour
+        uint8_t r = (uint8_t)col[0], g = (uint8_t)(col[0] >> 8),
+                b = (uint8_t)(col[0] >> 16);
+        uint32_t c = !textured ? Argb(r, g, b, mode)
+                     : raw     ? Argb(255, 255, 255, mode)
+                               : TexArgb(r, g, b, mode);
+        argb[0] = argb[1] = argb[2] = argb[3] = c;
+    } else {
+        for (int i = 0; i < n; i++) {
+            uint8_t r = (uint8_t)col[i], g = (uint8_t)(col[i] >> 8),
+                    b = (uint8_t)(col[i] >> 16);
+            argb[i] = textured ? TexArgb(r, g, b, mode) : Argb(r, g, b, mode);
+        }
+    }
     // screen position: (x + offset) * scale, the offset added once
     const float ox = (float)(draw_offset.x - fb_origin.x);
     const float oy = (float)(draw_offset.y - fb_origin.y + disp_top);
+#ifndef PSYZ_GTE_SUBPIXEL
+    // the usual case, wholly inside the drawing area: the vertices go
+    // straight to the TA (ClipToArea's test, in PS1 coordinates)
+    int area = clip_to_area ? AreaTest(xmin, ymin, xmax, ymax) : 1;
+    if (area == 0) {
+        return;
+    }
+    if (area > 0 && mode != 2) {
+        SendHeader(t, mode, false);
+        for (int i = 0; i < n; i++) {
+            EmitVertex(((float)x[i] + ox) * scale_x, ((float)y[i] + oy) * scale_y,
+                       BlockU(t, u[i]), BlockV(t, v[i]), argb[i], i + 1 == n);
+        }
+        return;
+    }
+#endif
+    Vtx out[4];
+    (void)xy_word; // read only with PSYZ_GTE_SUBPIXEL
     for (int i = 0; i < n; i++) {
         out[i].x = ((float)x[i] + ox) * scale_x;
         out[i].y = ((float)y[i] + oy) * scale_y;
         out[i].z = 0.0f;
         out[i].u = BlockU(t, u[i]);
         out[i].v = BlockV(t, v[i]);
+        out[i].argb = argb[i];
     }
 #ifdef PSYZ_GTE_SUBPIXEL
     {
@@ -2005,23 +2113,6 @@ static void PushPoly(const u_long* p, int code) {
         }
     }
 #endif
-    if (!gouraud || raw) { // one colour
-        uint8_t r = (uint8_t)col[0], g = (uint8_t)(col[0] >> 8),
-                b = (uint8_t)(col[0] >> 16);
-        uint32_t c = !textured ? Argb(r, g, b, mode)
-                     : raw     ? Argb(255, 255, 255, mode)
-                               : TexArgb(r, g, b, mode);
-        for (int i = 0; i < n; i++) {
-            out[i].argb = c;
-        }
-    } else {
-        for (int i = 0; i < n; i++) {
-            uint8_t r = (uint8_t)col[i], g = (uint8_t)(col[i] >> 8),
-                    b = (uint8_t)(col[i] >> 16);
-            out[i].argb =
-                textured ? TexArgb(r, g, b, mode) : Argb(r, g, b, mode);
-        }
-    }
     SubmitStrip(out, n, t, mode, false);
 }
 

@@ -58,8 +58,12 @@ the desktop software renderer. Not yet on hardware or in an emulator.
   opening field scenes 86-93% of model polygons are found.
 - **Drawing area.** Primitives are clipped to the drawing area (GP0
   E3/E4), as the PS1 does; menus draw models and scrolling lists in a
-  window this way. A primitive wholly inside is sent as it is, one across
-  the edge is clipped on the CPU. Fills and uploads ignore the area.
+  window this way. A primitive wholly inside (tested on its PS1
+  coordinates) goes straight from the packet to the TA, its vertices
+  written into a store queue with no copy in between; one across the edge
+  is clipped on the CPU. Fills and uploads ignore the area. The texture
+  found for the previous primitive is tried before the find cache, as
+  primitives come in runs of one texture.
 - **Texture windows** (GP0 E2) that repeat a tile, the usual kind, take a
   block of one period (at least 16 texels, the tile repeating inside it)
   that the PVR repeats; dialog boxes fill with a 32x32 tile this way.
@@ -172,6 +176,7 @@ in the same frame shows up as it would on hardware.
 
 - Run on hardware or Flycast with the discs; check the frame origin logic
   with the game's real draw/display environments.
-- Speed: vertices through the store queues (`pvr_dr_*`) instead of
-  `pvr_prim`, twiddled or paletted textures.
+- Speed: a leaner GTE and GPU queue (see `platform/dreamcast/pchost/bench.py`
+  in the game repository for the measurements), twiddled or paletted
+  textures.
 - Reverb on the AICA DSP.
