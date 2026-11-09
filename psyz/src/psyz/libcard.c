@@ -17,8 +17,16 @@ static inline int validate_chan(long chan) {
     return 1;
 }
 
+#ifdef PLATFORM_DREAMCAST
+// src/dreamcast/dc_card.c: the cards are VMUs
+void DcCard_Init(void);
+int DcCard_Present(int port);
+#endif
+
 void _bu_init(void) {
-#ifdef PE_PS5
+#ifdef PLATFORM_DREAMCAST
+    DcCard_Init();
+#elif defined(PE_PS5)
     char path[4096];
     Psyz_AdjustPath(path, "bu00:*", sizeof(path));
     Psyz_AdjustPath(path, "bu10:*", sizeof(path));
@@ -40,7 +48,8 @@ long _card_auto(long val) {
 
 static long last_chan;
 
-// Cards live as host directories and are always plugged in, but there is no
+// Cards live as host directories and are always plugged in (on the
+// Dreamcast, when that controller port has a VMU), but there is no
 // multi-tap, so its extra slots time out like an empty port.
 static long card_op(unsigned int sw_desc, long chan) {
     if (!validate_chan(chan)) {
@@ -48,6 +57,11 @@ static long card_op(unsigned int sw_desc, long chan) {
     }
     last_chan = chan;
     unsigned int spec = (chan & 15) ? EvSpTIMOUT : EvSpIOE;
+#ifdef PLATFORM_DREAMCAST
+    if (!DcCard_Present((int)(chan >> 4))) {
+        spec = EvSpTIMOUT; // no VMU in that controller port
+    }
+#endif
     if (sw_desc) {
         Psyz_KernelRaise(sw_desc, spec);
     }

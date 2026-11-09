@@ -125,6 +125,20 @@ bits, dithering, per-texel STP on semi-transparent primitives (the whole
 primitive blends), and textured colours above 0x80 (the PVR modulates up to
 1.0, the PS1 up to 2.0).
 
+## Memory cards
+
+`dc_card.c` puts the PS1 memory cards on VMUs: card 1 (`bu00:`) is the VMU
+in controller port A, card 2 (`bu10:`) the one in port B; a port without a
+VMU reports no card. The cards are a small KOS filesystem (`/pscard/0`,
+`/pscard/1`) that `Psyz_AdjustPath` maps the `buXX:` names to, so the
+libapi file calls and the game's own stdio work on it unchanged. Files live
+in RAM, are read from the VMU on first use and written back when closed
+after a write or renamed to a final name (names starting with `.`, the
+game's temporary files, are never written). Each PS1 save is one VMU file,
+`PE1_` and a hash of its PS1 name: a VMS header with the save's own icon
+(16x16 scaled to 32x32) and its title in ASCII, then `PSXC`, the 20-byte PS1
+name and the data. An 8 KB save takes 19 of the VMU's 200 blocks.
+
 ## Build
 
 ```sh
