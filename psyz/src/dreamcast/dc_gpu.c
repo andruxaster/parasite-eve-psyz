@@ -315,102 +315,59 @@ static inline uint16_t Convert(uint16_t c, int raw) {
     return raw || c ? (uint16_t)(0x8000 | rgb) : 0;
 }
 
-// One row of a slot's texels (w of them from s->u0) as ARGB1555.
-static void DecodeRow(const TexSlot* s, int bpp, int raw, const uint16_t* pal,
-                      int v, uint16_t* out) {
-    uint64_t key = s->key;
-    int page_x = (int)(key & 0xF) * 64;
-    int page_y = (int)((key >> 4) & 1) * 256;
-    int w = s->w;
-    const uint16_t* row =
-        &vram[((page_y + ((s->v0 + v) & 255)) & (VRAM_H - 1)) * VRAM_W];
-    if (bpp == 2) {
-        for (int u = 0; u < w; u++)
-            out[u] = Convert(row[(page_x + ((s->u0 + u) & 255)) & (VRAM_W - 1)], raw);
-    } else if (bpp == 0) {
-        int h0 = s->u0 / 4;
-        for (int i = 0; i < w / 4; i++) {
-            uint16_t px = row[(page_x + ((h0 + i) & 63)) & (VRAM_W - 1)];
-            out[i * 4] = pal[px & 0xF];
-            out[i * 4 + 1] = pal[(px >> 4) & 0xF];
-            out[i * 4 + 2] = pal[(px >> 8) & 0xF];
-            out[i * 4 + 3] = pal[px >> 12];
-        }
-    } else {
-        int h0 = s->u0 / 2;
-        for (int i = 0; i < w / 2; i++) {
-            uint16_t px = row[(page_x + ((h0 + i) & 127)) & (VRAM_W - 1)];
-            out[i * 2] = pal[px & 0xFF];
-            out[i * 2 + 1] = pal[px >> 8];
-        }
-    }
-}
-
-// Bilinear filtering mixes a transparent texel's colour into its opaque
-// neighbours' edges; transparent black would leave dark fringes. Give each
-// transparent texel the colour of an opaque neighbour (left, right, above,
-// below), keeping it transparent.
-static void BleedRow(uint16_t* cur, const uint16_t* above,
-                     const uint16_t* below, int w) {
-    for (int u = 0; u < w; u++) {
-        if (cur[u] & 0x8000)
-            continue;
-        uint16_t c = 0;
-        if (u > 0 && (cur[u - 1] & 0x8000))
-            c = cur[u - 1];
-        else if (u + 1 < w && (cur[u + 1] & 0x8000))
-            c = cur[u + 1];
-        else if (above && (above[u] & 0x8000))
-            c = above[u];
-        else if (below && (below[u] & 0x8000))
-            c = below[u];
-        cur[u] = c & 0x7FFF;
-    }
-}
-
 static void DecodeSlot(TexSlot* s) {
     uint64_t t0 = timer_us_gettime64();
     uint64_t key = s->key;
+    int page_x = (int)(key & 0xF) * 64;
+    int page_y = (int)((key >> 4) & 1) * 256;
     int bpp = (int)(key >> 5) & 3;
     int raw = bpp == 2 ? (int)KeyClut(key) & 1 : 0;
     int w = s->w, h = s->h;
-    uint16_t pal[256];
-    if (bpp != 2) {
+    uint32_t* dst = (uint32_t*)s->ptr;
+    if (bpp == 2) {
+        for (int v = 0; v < h; v++) {
+            const uint16_t* row =
+                &vram[((page_y + ((s->v0 + v) & 255)) & (VRAM_H - 1)) * VRAM_W];
+            for (int u = 0; u < w; u += 2) {
+                int ua = (s->u0 + u) & 255, ub = (s->u0 + u + 1) & 255;
+                uint16_t a = Convert(row[(page_x + ua) & (VRAM_W - 1)], raw);
+                uint16_t b = Convert(row[(page_x + ub) & (VRAM_W - 1)], raw);
+                *dst++ = a | ((uint32_t)b << 16);
+            }
+        }
+    } else {
         uint32_t clut = KeyClut(key);
         int cx = (int)(clut & 0x3F) * 16;
         int cy = (int)(clut >> 6) & 0x1FF;
         int colors = bpp ? 256 : 16;
+        uint16_t pal[256];
         for (int i = 0; i < colors; i++) {
             pal[i] =
                 Convert(vram[cy * VRAM_W + ((cx + i) & (VRAM_W - 1))], raw);
         }
-    }
-    // rows decoded one ahead, so a row's transparent texels see both
-    // vertical neighbours; finished rows are gathered and sent to PVR
-    // memory through the store queues, much faster than single stores
-    static uint16_t rows[3][256] __attribute__((aligned(32)));
-    static uint16_t stage[4096] __attribute__((aligned(32)));
-    unsigned staged = 0, stage_rows = sizeof(stage) / sizeof(stage[0]) / (unsigned)w;
-    uint8_t* out = (uint8_t*)s->ptr;
-    uint16_t *above = NULL, *cur = rows[0], *below = rows[1];
-    DecodeRow(s, bpp, raw, pal, 0, cur);
-    for (int v = 0; v < h; v++) {
-        uint16_t* next = v + 1 < h ? below : NULL;
-        if (next)
-            DecodeRow(s, bpp, raw, pal, v + 1, next);
-        if (!raw)
-            BleedRow(cur, above, next, w);
-        memcpy(&stage[staged * (unsigned)w], cur, (size_t)w * 2);
-        if (++staged == stage_rows || v + 1 == h) {
-            size_t bytes = (size_t)staged * (size_t)w * 2;
-            pvr_txr_load(stage, out, bytes);
-            out += bytes;
-            staged = 0;
+        int halfwords = bpp ? w / 2 : w / 4;
+        int page_halfwords = bpp ? 128 : 64;
+        int h0 = bpp ? s->u0 / 2 : s->u0 / 4;
+        for (int v = 0; v < h; v++) {
+            const uint16_t* row =
+                &vram[((page_y + ((s->v0 + v) & 255)) & (VRAM_H - 1)) * VRAM_W];
+            if (bpp == 0) {
+                for (int i = 0; i < halfwords; i++) {
+                    int hx = page_x + ((h0 + i) & (page_halfwords - 1));
+                    uint16_t px = row[hx & (VRAM_W - 1)];
+                    *dst++ = pal[px & 0xF] |
+                             ((uint32_t)pal[(px >> 4) & 0xF] << 16);
+                    *dst++ = pal[(px >> 8) & 0xF] |
+                             ((uint32_t)pal[px >> 12] << 16);
+                }
+            } else {
+                for (int i = 0; i < halfwords; i++) {
+                    int hx = page_x + ((h0 + i) & (page_halfwords - 1));
+                    uint16_t px = row[hx & (VRAM_W - 1)];
+                    *dst++ = pal[px & 0xFF] | ((uint32_t)pal[px >> 8] << 16);
+                }
+            }
         }
-        uint16_t* spare = above ? above : rows[2];
-        above = cur;
-        cur = next;
-        below = spare;
     }
 #ifdef DCGPU_TRACE
     {
@@ -905,7 +862,7 @@ static void Present24(void) {
     stats.movie_us += timer_us_gettime64() - t_movie;
     if (frame24_hdr_h != tex_h) {
         CompileHeaderFmt(&frame24_hdr, frame24, PVR_TXRFMT_RGB565, FRAME24_W,
-                         tex_h, BLEND_OPAQUE, false, true);
+                         tex_h, BLEND_OPAQUE, false, false);
         frame24_hdr_h = tex_h;
     }
     cur_hdr = -100; // a header no cache entry matches
@@ -1606,7 +1563,7 @@ static void PushPoly(const u_long* p, int code) {
                       : raw     ? Argb(255, 255, 255, mode)
                                 : TexArgb(r, g, b, mode);
     }
-    SubmitStrip(out, n, t, mode, true);
+    SubmitStrip(out, n, t, mode, false);
 }
 
 static void PushRect(const u_long* p, int code) {

@@ -40,10 +40,9 @@ the desktop software renderer. Not yet on hardware or in an emulator.
   current frame is never overwritten: the PVR reads textures when it
   renders the finished scene, after the CPU has moved on. Every 300 frames
   the backend logs frame rate, decodes and where the time went.
-- **Filtering.** Polygons (models, backgrounds) and the 24-bit movie frame
-  are filtered bilinearly; sprites and text stay sharp. A transparent texel
-  takes an opaque neighbour's colour when decoded, so filtering leaves no
-  dark fringe around cut-outs.
+- **Filtering.** Textures are point-sampled, as on the PS1. (Bilinear
+  filtering was tried: it needs transparent texels recoloured when decoded,
+  which doubled decoding time and slowed rooms down.)
 - **Subpixel vertices and perspective** (off in the game's Dreamcast build
   for now). With `PSYZ_GTE_SUBPIXEL` the GTE keeps the 8 fractional bits of each projected
   X/Y it would drop, and SZ, by the address the game stores the vertex to
