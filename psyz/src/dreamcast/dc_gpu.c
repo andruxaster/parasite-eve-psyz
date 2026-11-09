@@ -374,7 +374,6 @@ static void DecodeSlot(TexSlot* s) {
     int bpp = (int)(key >> 5) & 3;
     int raw = bpp == 2 ? (int)KeyClut(key) & 1 : 0;
     int w = s->w, h = s->h;
-    uint32_t* dst = (uint32_t*)s->ptr;
     uint16_t pal[256];
     if (bpp != 2) {
         uint32_t clut = KeyClut(key);
@@ -387,8 +386,12 @@ static void DecodeSlot(TexSlot* s) {
         }
     }
     // rows decoded one ahead, so a row's transparent texels see both
-    // vertical neighbours before it is written
-    static uint16_t rows[3][256];
+    // vertical neighbours; finished rows are gathered and sent to PVR
+    // memory through the store queues, much faster than single stores
+    static uint16_t rows[3][256] __attribute__((aligned(32)));
+    static uint16_t stage[4096] __attribute__((aligned(32)));
+    unsigned staged = 0, stage_rows = sizeof(stage) / sizeof(stage[0]) / (unsigned)w;
+    uint8_t* out = (uint8_t*)s->ptr;
     uint16_t *above = NULL, *cur = rows[0], *below = rows[1];
     DecodeRow(s, bpp, raw, pal, 0, cur);
     for (int v = 0; v < h; v++) {
@@ -397,8 +400,13 @@ static void DecodeSlot(TexSlot* s) {
             DecodeRow(s, bpp, raw, pal, v + 1, next);
         if (!raw)
             BleedRow(cur, above, next, w);
-        for (int u = 0; u < w; u += 2)
-            *dst++ = cur[u] | ((uint32_t)cur[u + 1] << 16);
+        memcpy(&stage[staged * (unsigned)w], cur, (size_t)w * 2);
+        if (++staged == stage_rows || v + 1 == h) {
+            size_t bytes = (size_t)staged * (size_t)w * 2;
+            pvr_txr_load(stage, out, bytes);
+            out += bytes;
+            staged = 0;
+        }
         uint16_t* spare = above ? above : rows[2];
         above = cur;
         cur = next;
@@ -879,7 +887,10 @@ static void Present24(void) {
         const uint8_t* src = (const uint8_t*)&vram[((disp_area.y + y) &
                                                     (VRAM_H - 1)) * VRAM_W];
         src += disp_area.x * 2;
-        uint32_t* dst = (uint32_t*)((uint16_t*)frame24 + y * FRAME24_W);
+        // converted in cache, sent through the store queues (a row of the
+        // 512-wide texture holds the padding to 32 bytes)
+        static uint32_t row[FRAME24_W / 2] __attribute__((aligned(32)));
+        uint32_t* dst = row;
         for (int x = 0; x < w; x += 2, src += 6) {
             uint32_t a = ((src[0] >> 3) << 11) | ((src[1] >> 2) << 5) |
                          (src[2] >> 3);
@@ -887,6 +898,8 @@ static void Present24(void) {
                          (src[5] >> 3);
             *dst++ = a | (b << 16);
         }
+        pvr_txr_load(row, (uint16_t*)frame24 + y * FRAME24_W,
+                     ((size_t)w * 2 + 31) & ~(size_t)31);
     }
     frame24_dirty = false;
     stats.movie_us += timer_us_gettime64() - t_movie;
