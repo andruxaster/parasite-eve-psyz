@@ -710,11 +710,39 @@ static short hermite4(
     return clamp16(iv);
 }
 
+static int xa_native_rate;
+void Psyz_CdSetNativeXaRate(int enabled) { xa_native_rate = enabled != 0; }
+unsigned Psyz_CdOutputRate(void) {
+    return xa_native_rate && !(CD_mode & CdlModeDA) ? 37800u : 44100u;
+}
+
 static size_t xa_pull_samples(short* buf, size_t max_frames) {
     size_t written = 0;
     int hit_eof = 0;
     Psyz_AudioLock();
     if (!is_playing || (!track_file && !disk_read_cb) || !xa.active) {
+        goto end;
+    }
+    if (xa_native_rate) {
+        // decoded 37800 Hz frames as they are; the backend plays them at
+        // that rate
+        while (written < max_frames) {
+            if (xa.decoded_pos >= xa.decoded_count &&
+                !xa_read_and_decode_sector()) {
+                hit_eof = 1;
+                goto end;
+            }
+            size_t n = (size_t)(xa.decoded_count - xa.decoded_pos);
+            if (n > max_frames - written)
+                n = max_frames - written;
+            if (is_muted)
+                memset(&buf[written * 2], 0, n * 2 * sizeof(short));
+            else
+                memcpy(&buf[written * 2], &xa.decoded[xa.decoded_pos * 2],
+                       n * 2 * sizeof(short));
+            xa.decoded_pos += (int)n;
+            written += n;
+        }
         goto end;
     }
     // Prime Hermite ring on first call so we have y0..y2 valid.

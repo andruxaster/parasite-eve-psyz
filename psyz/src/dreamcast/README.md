@@ -40,6 +40,20 @@ the desktop software renderer. Not yet on hardware or in an emulator.
   current frame is never overwritten: the PVR reads textures when it
   renders the finished scene, after the CPU has moved on. Every 300 frames
   the backend logs frame rate, decodes and where the time went.
+- **Filtering.** Polygons (models, backgrounds) and the 24-bit movie frame
+  are filtered bilinearly; sprites and text stay sharp. A transparent texel
+  takes an opaque neighbour's colour when decoded, so filtering leaves no
+  dark fringe around cut-outs.
+- **Subpixel vertices and perspective.** With `PSYZ_GTE_SUBPIXEL` (set in
+  the Dreamcast build) the GTE keeps the 8 fractional bits of each projected
+  X/Y it would drop, and SZ, by the address the game stores the vertex to
+  (`gte_stsxy`, and the copies `Psyz_GteCopyPgxpSxy` reports) and by screen
+  position (`include/psyz/subpixel.h`). A polygon whose vertices are all
+  found is placed between pixels and given 1/SZ as the PVR's depth, so its
+  texture is perspective-correct. That removes most of the PS1's vertex
+  snapping and texture swimming without PGXP's memory and double-precision
+  cost; the jitter of the game's 12-bit fixed-point matrices remains. In the
+  opening field scenes 86-93% of model polygons are found.
 - **Transparency.** Colour 0 is transparent. Semi-transparency modes 0
   (B/2+F/2), 1 (B+F) and 3 (B+F/4) use PVR blending with vertex alpha.
   Mode 2 (B-F) has no PVR blend, so the primitive is drawn three times:
@@ -75,7 +89,9 @@ chip and keeps on the CPU what the game reads back:
   every update; with the voice and main volumes it sets the channel's total
   level and pan. ENVX reads back from it. A sample without a repeat ends
   when its tracked position passes its length.
-- **CD and XA audio** go out on a KOS sound stream at 44.1 kHz.
+- **CD and XA audio** go out on a KOS sound stream. XA plays at its own
+  37.8 kHz (`Psyz_CdSetNativeXaRate`): libcd's resampler to 44.1 kHz uses
+  `fmaf`, which the SH-4 does in software, about a quarter of its time.
 
 Not done yet: reverb (the AICA DSP could), noise, pitch modulation, volume
 sweeps and the capture buffers. Interpolation is linear rather than

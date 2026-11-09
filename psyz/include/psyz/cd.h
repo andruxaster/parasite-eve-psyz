@@ -56,6 +56,12 @@ void Psyz_CdShellOpen(int is_open);
  */
 size_t Psyz_CdPullSamples(short* out, size_t num_frames);
 
+/* With enabled set, XA audio comes out of Psyz_CdPullSamples at its own
+ * 37800 Hz instead of resampled to 44100 Hz, for backends that can play it
+ * at that rate. Psyz_CdOutputRate tells the rate of what it returns now. */
+void Psyz_CdSetNativeXaRate(int enabled);
+unsigned Psyz_CdOutputRate(void);
+
 /**
  * @brief Set callback invoked when a disk read is triggered
  *

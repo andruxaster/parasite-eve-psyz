@@ -1,8 +1,11 @@
 // Sega Dreamcast audio. The SPU's voices play on AICA channels (dc_spu.c);
 // a thread advances them with the clock every few milliseconds and keeps
 // KOS's sound stream fed with CD/XA audio, which libcd decodes on demand.
+// XA plays at its own 37.8 kHz: the stream restarts at whatever rate libcd
+// delivers, so nothing is resampled on the SH-4.
 #include <psyz.h>
 #include <psyz/log.h>
+#include <psyz/cd.h>
 #include <stddef.h>
 #include <string.h>
 #include <arch/timer.h>
@@ -22,6 +25,7 @@ static unsigned output_volume = 100;
 static PsyzAudioCaptureCallback capture_callback;
 static void* capture_userdata;
 static snd_stream_hnd_t stream = SND_STREAM_INVALID;
+static unsigned stream_rate;
 static kthread_t* thread;
 
 void Psyz_AudioSetCaptureCallback(
@@ -58,6 +62,12 @@ static void* AudioThread(void* arg) {
         remainder -= (uint64_t)frames * 1000000;
         if (frames && !is_paused)
             DcSpu_Update(frames);
+        unsigned rate = Psyz_CdOutputRate();
+        if (rate != stream_rate) {
+            snd_stream_stop(stream);
+            snd_stream_start(stream, rate, 1);
+            stream_rate = rate;
+        }
         snd_stream_poll(stream);
         thd_sleep(UPDATE_MS);
     }
@@ -75,7 +85,9 @@ int Psyz_AudioInit(void) {
         return -1;
     }
     snd_stream_volume(stream, 255);
-    snd_stream_start(stream, 44100, 1);
+    Psyz_CdSetNativeXaRate(1);
+    stream_rate = Psyz_CdOutputRate();
+    snd_stream_start(stream, stream_rate, 1);
     stop_requested = 0;
     thread = thd_create(0, AudioThread, NULL);
     if (!thread) {

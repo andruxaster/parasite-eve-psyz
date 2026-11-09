@@ -39,6 +39,9 @@
 #include <kos/thread.h>
 #include <kos/timer.h>
 #include "../draw.h"
+#ifdef PSYZ_GTE_SUBPIXEL
+#include <psyz/subpixel.h>
+#endif
 
 #define VRAM_W 1024
 #define VRAM_H 512
@@ -164,6 +167,7 @@ static PageStat page_stats[PAGE_STATS];
 #define STATS_FRAMES 300
 static struct {
     uint32_t decodes, decoded_texels, overwrites, vertices, frames;
+    uint32_t polys, subpixel_polys; // polygons; those placed between pixels
     uint64_t decode_us, start_us;
     uint64_t pvr_wait_us; // pvr_wait_ready: the PVR still drawing
     uint64_t vblank_us;   // vid_waitvbl: nothing left to do this frame
@@ -311,59 +315,94 @@ static inline uint16_t Convert(uint16_t c, int raw) {
     return raw || c ? (uint16_t)(0x8000 | rgb) : 0;
 }
 
-static void DecodeSlot(TexSlot* s) {
-    uint64_t t0 = timer_us_gettime64();
+// One row of a slot's texels (w of them from s->u0) as ARGB1555.
+static void DecodeRow(const TexSlot* s, int bpp, int raw, const uint16_t* pal,
+                      int v, uint16_t* out) {
     uint64_t key = s->key;
     int page_x = (int)(key & 0xF) * 64;
     int page_y = (int)((key >> 4) & 1) * 256;
+    int w = s->w;
+    const uint16_t* row =
+        &vram[((page_y + ((s->v0 + v) & 255)) & (VRAM_H - 1)) * VRAM_W];
+    if (bpp == 2) {
+        for (int u = 0; u < w; u++)
+            out[u] = Convert(row[(page_x + ((s->u0 + u) & 255)) & (VRAM_W - 1)], raw);
+    } else if (bpp == 0) {
+        int h0 = s->u0 / 4;
+        for (int i = 0; i < w / 4; i++) {
+            uint16_t px = row[(page_x + ((h0 + i) & 63)) & (VRAM_W - 1)];
+            out[i * 4] = pal[px & 0xF];
+            out[i * 4 + 1] = pal[(px >> 4) & 0xF];
+            out[i * 4 + 2] = pal[(px >> 8) & 0xF];
+            out[i * 4 + 3] = pal[px >> 12];
+        }
+    } else {
+        int h0 = s->u0 / 2;
+        for (int i = 0; i < w / 2; i++) {
+            uint16_t px = row[(page_x + ((h0 + i) & 127)) & (VRAM_W - 1)];
+            out[i * 2] = pal[px & 0xFF];
+            out[i * 2 + 1] = pal[px >> 8];
+        }
+    }
+}
+
+// Bilinear filtering mixes a transparent texel's colour into its opaque
+// neighbours' edges; transparent black would leave dark fringes. Give each
+// transparent texel the colour of an opaque neighbour (left, right, above,
+// below), keeping it transparent.
+static void BleedRow(uint16_t* cur, const uint16_t* above,
+                     const uint16_t* below, int w) {
+    for (int u = 0; u < w; u++) {
+        if (cur[u] & 0x8000)
+            continue;
+        uint16_t c = 0;
+        if (u > 0 && (cur[u - 1] & 0x8000))
+            c = cur[u - 1];
+        else if (u + 1 < w && (cur[u + 1] & 0x8000))
+            c = cur[u + 1];
+        else if (above && (above[u] & 0x8000))
+            c = above[u];
+        else if (below && (below[u] & 0x8000))
+            c = below[u];
+        cur[u] = c & 0x7FFF;
+    }
+}
+
+static void DecodeSlot(TexSlot* s) {
+    uint64_t t0 = timer_us_gettime64();
+    uint64_t key = s->key;
     int bpp = (int)(key >> 5) & 3;
     int raw = bpp == 2 ? (int)KeyClut(key) & 1 : 0;
     int w = s->w, h = s->h;
     uint32_t* dst = (uint32_t*)s->ptr;
-    if (bpp == 2) {
-        for (int v = 0; v < h; v++) {
-            const uint16_t* row =
-                &vram[((page_y + ((s->v0 + v) & 255)) & (VRAM_H - 1)) * VRAM_W];
-            for (int u = 0; u < w; u += 2) {
-                int ua = (s->u0 + u) & 255, ub = (s->u0 + u + 1) & 255;
-                uint16_t a = Convert(row[(page_x + ua) & (VRAM_W - 1)], raw);
-                uint16_t b = Convert(row[(page_x + ub) & (VRAM_W - 1)], raw);
-                *dst++ = a | ((uint32_t)b << 16);
-            }
-        }
-    } else {
+    uint16_t pal[256];
+    if (bpp != 2) {
         uint32_t clut = KeyClut(key);
         int cx = (int)(clut & 0x3F) * 16;
         int cy = (int)(clut >> 6) & 0x1FF;
         int colors = bpp ? 256 : 16;
-        uint16_t pal[256];
         for (int i = 0; i < colors; i++) {
             pal[i] =
                 Convert(vram[cy * VRAM_W + ((cx + i) & (VRAM_W - 1))], raw);
         }
-        int halfwords = bpp ? w / 2 : w / 4;
-        int page_halfwords = bpp ? 128 : 64;
-        int h0 = bpp ? s->u0 / 2 : s->u0 / 4;
-        for (int v = 0; v < h; v++) {
-            const uint16_t* row =
-                &vram[((page_y + ((s->v0 + v) & 255)) & (VRAM_H - 1)) * VRAM_W];
-            if (bpp == 0) {
-                for (int i = 0; i < halfwords; i++) {
-                    int hx = page_x + ((h0 + i) & (page_halfwords - 1));
-                    uint16_t px = row[hx & (VRAM_W - 1)];
-                    *dst++ = pal[px & 0xF] |
-                             ((uint32_t)pal[(px >> 4) & 0xF] << 16);
-                    *dst++ = pal[(px >> 8) & 0xF] |
-                             ((uint32_t)pal[px >> 12] << 16);
-                }
-            } else {
-                for (int i = 0; i < halfwords; i++) {
-                    int hx = page_x + ((h0 + i) & (page_halfwords - 1));
-                    uint16_t px = row[hx & (VRAM_W - 1)];
-                    *dst++ = pal[px & 0xFF] | ((uint32_t)pal[px >> 8] << 16);
-                }
-            }
-        }
+    }
+    // rows decoded one ahead, so a row's transparent texels see both
+    // vertical neighbours before it is written
+    static uint16_t rows[3][256];
+    uint16_t *above = NULL, *cur = rows[0], *below = rows[1];
+    DecodeRow(s, bpp, raw, pal, 0, cur);
+    for (int v = 0; v < h; v++) {
+        uint16_t* next = v + 1 < h ? below : NULL;
+        if (next)
+            DecodeRow(s, bpp, raw, pal, v + 1, next);
+        if (!raw)
+            BleedRow(cur, above, next, w);
+        for (int u = 0; u < w; u += 2)
+            *dst++ = cur[u] | ((uint32_t)cur[u + 1] << 16);
+        uint16_t* spare = above ? above : rows[2];
+        above = cur;
+        cur = next;
+        below = spare;
     }
 #ifdef DCGPU_TRACE
     {
@@ -642,12 +681,12 @@ static TexSlot* FindTexture(u16 tpage, u16 clut, int variant, int umin,
 }
 
 static void CompileHeaderFmt(pvr_poly_hdr_t* hdr, pvr_ptr_t txr, int fmt,
-                             int w, int h, int mode, bool clamp) {
+                             int w, int h, int mode, bool clamp, bool filter) {
     pvr_poly_cxt_t cxt;
     if (txr) {
         pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY,
                          fmt | PVR_TXRFMT_NONTWIDDLED, w, h, txr,
-                         PVR_FILTER_NONE);
+                         filter ? PVR_FILTER_BILINEAR : PVR_FILTER_NONE);
         cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
         cxt.txr.alpha = false; // false enables the texture's alpha
         cxt.txr.uv_clamp = clamp ? PVR_UVCLAMP_UV : PVR_UVCLAMP_NONE;
@@ -683,11 +722,13 @@ static void CompileHeaderFmt(pvr_poly_hdr_t* hdr, pvr_ptr_t txr, int fmt,
 }
 
 static void CompileHeader(pvr_poly_hdr_t* hdr, pvr_ptr_t txr, int mode) {
-    CompileHeaderFmt(hdr, txr, PVR_TXRFMT_ARGB1555, 256, 256, mode, false);
+    CompileHeaderFmt(hdr, txr, PVR_TXRFMT_ARGB1555, 256, 256, mode, false, false);
 }
 
-static void SendHeader(TexSlot* t, int mode) {
-    int id = t ? (int)(t - tex_slots) * BLEND_MODES + mode : -1 - mode;
+// filter: bilinear texture filtering (polygons; sprites and text stay sharp)
+static void SendHeader(TexSlot* t, int mode, bool filter) {
+    int id = t ? ((int)(t - tex_slots) * BLEND_MODES + mode) * 2 + filter
+               : -1 - mode;
     if (id == cur_hdr) {
         return;
     }
@@ -698,7 +739,7 @@ static void SendHeader(TexSlot* t, int mode) {
     }
     pvr_poly_hdr_t hdr;
     CompileHeaderFmt(&hdr, t->ptr, PVR_TXRFMT_ARGB1555, t->w, t->h, mode,
-                     t->w < 256 || t->h < 256);
+                     t->w < 256 || t->h < 256, filter);
     pvr_prim(&hdr, sizeof(hdr));
 }
 
@@ -806,7 +847,7 @@ static void EndScene(void) {
         INFOF("gpu: %u frames in %u ms (%u.%u fps), %u verts/frame, "
               "%u decodes (%u Ktexels, %u ms), %u in-frame overwrites; "
               "waiting for PVR %u ms, idle in vblank %u ms, movie upload "
-              "%u ms",
+              "%u ms; %u%% of polygons subpixel",
               stats.frames, ms, ms ? stats.frames * 1000u / ms : 0,
               ms ? stats.frames * 10000u / ms % 10 : 0,
               stats.vertices / stats.frames, stats.decodes,
@@ -814,7 +855,8 @@ static void EndScene(void) {
               (uint32_t)(stats.decode_us / 1000u), stats.overwrites,
               (uint32_t)(stats.pvr_wait_us / 1000u),
               (uint32_t)(stats.vblank_us / 1000u),
-              (uint32_t)(stats.movie_us / 1000u));
+              (uint32_t)(stats.movie_us / 1000u),
+              stats.polys ? stats.subpixel_polys * 100u / stats.polys : 0);
         memset(&stats, 0, sizeof(stats));
         stats.start_us = now;
     }
@@ -850,7 +892,7 @@ static void Present24(void) {
     stats.movie_us += timer_us_gettime64() - t_movie;
     if (frame24_hdr_h != tex_h) {
         CompileHeaderFmt(&frame24_hdr, frame24, PVR_TXRFMT_RGB565, FRAME24_W,
-                         tex_h, BLEND_OPAQUE, false);
+                         tex_h, BLEND_OPAQUE, false, true);
         frame24_hdr_h = tex_h;
     }
     cur_hdr = -100; // a header no cache entry matches
@@ -904,6 +946,9 @@ int Psyz_VideoVSync(int mode) {
         Present24();
     }
     EndScene();
+#ifdef PSYZ_GTE_SUBPIXEL
+    Psyz_SubpixelNextFrame();
+#endif
     uint64_t t0 = timer_us_gettime64();
     uint32_t target = vblank_count + (uint32_t)(mode > 1 ? mode : 1);
     if (vblank_counting) {
@@ -923,6 +968,7 @@ int Psyz_VideoVSync(int mode) {
 typedef struct {
     float x, y, u, v;
     uint32_t argb;
+    float z; // 1/w for perspective-correct texturing; 0 means 1
 } Vtx;
 
 static inline bool CanDraw(int vertices) {
@@ -981,10 +1027,10 @@ static void MaskBorders(void) {
 
 static void SubmitVertices(const Vtx* v, int n, bool white) {
     pvr_vertex_t out;
-    out.z = 1.0f;
     out.oargb = 0;
     for (int i = 0; i < n; i++) {
         out.flags = i + 1 < n ? PVR_CMD_VERTEX : PVR_CMD_VERTEX_EOL;
+        out.z = v[i].z > 0.0f ? v[i].z : 1.0f;
         out.x = v[i].x;
         out.y = v[i].y;
         out.u = v[i].u;
@@ -995,9 +1041,10 @@ static void SubmitVertices(const Vtx* v, int n, bool white) {
 }
 
 // n vertices in triangle-strip order
-static void SubmitStrip(const Vtx* v, int n, TexSlot* t, int mode) {
+static void SubmitStrip(const Vtx* v, int n, TexSlot* t, int mode,
+                        bool filter) {
     if (mode != 2) {
-        SendHeader(t, mode);
+        SendHeader(t, mode, filter);
         SubmitVertices(v, n, false);
         return;
     }
@@ -1007,11 +1054,11 @@ static void SubmitStrip(const Vtx* v, int n, TexSlot* t, int mode) {
         return;
     }
     frame_vertices += 2 * n;
-    SendHeader(NULL, BLEND_INVERT);
+    SendHeader(NULL, BLEND_INVERT, false);
     SubmitVertices(v, n, true);
-    SendHeader(t, 2);
+    SendHeader(t, 2, filter);
     SubmitVertices(v, n, false);
-    SendHeader(NULL, BLEND_INVERT);
+    SendHeader(NULL, BLEND_INVERT, false);
     SubmitVertices(v, n, true);
 }
 
@@ -1056,7 +1103,7 @@ static void EmitRect(int x0, int y0, int x1, int y1, int u0, int v0, int u1,
         {fx0, fy1, fu0, fv1, c},
         {fx1, fy1, fu1, fv1, c},
     };
-    SubmitStrip(v, 4, t, mode);
+    SubmitStrip(v, 4, t, mode, false);
 }
 
 // one framebuffer-space rectangle drawn from VRAM itself (uploads and copies
@@ -1096,7 +1143,7 @@ static void EmitVramRegionQuad(int x, int y, int w, int h) {
                 {sx0, sy1, u0, v1, c},
                 {sx1, sy1, u1, v1, c},
             };
-            SubmitStrip(v, 4, t, BLEND_OPAQUE);
+            SubmitStrip(v, 4, t, BLEND_OPAQUE, false);
             px = nx;
         }
         py = ny;
@@ -1123,7 +1170,7 @@ static void EmitFill(int x, int y, int w, int h, uint8_t r, uint8_t g,
         {sx0, sy1, 0, 0, c},
         {sx1, sy1, 0, 0, c},
     };
-    SubmitStrip(v, 4, NULL, BLEND_OPAQUE);
+    SubmitStrip(v, 4, NULL, BLEND_OPAQUE, false);
 }
 
 // a line as a quad one PS1 pixel wide
@@ -1150,7 +1197,7 @@ static void EmitLine(int x0, int y0, uint32_t c0, int x1, int y1, uint32_t c1,
         {ax + ox, ay + oy, 0, 0, c0},
         {bx + ox, by + oy, 0, 0, c1},
     };
-    SubmitStrip(v, 4, NULL, mode);
+    SubmitStrip(v, 4, NULL, mode, false);
 }
 
 // ===== draw environment =====
@@ -1444,6 +1491,7 @@ static void PushPoly(const u_long* p, int code) {
         return;
     }
     int x[4], y[4], u[4] = {0}, v[4] = {0};
+    const u_long* xy_word[4];
     uint32_t col[4];
     u16 clut = 0, tpage = cur_tpage;
     const u_long* w = p;
@@ -1452,6 +1500,7 @@ static void PushPoly(const u_long* p, int code) {
         if (gouraud && i > 0) {
             col[i] = (uint32_t)*w++;
         }
+        xy_word[i] = w;
         uint32_t xy = (uint32_t)*w++;
         x[i] = s11(xy);
         y[i] = s11(xy >> 16);
@@ -1510,18 +1559,40 @@ static void PushPoly(const u_long* p, int code) {
                         vmax > vmin ? vmax - 1 : vmax);
     }
     Vtx out[4];
+    // vertices the GTE projected: between pixels, with depth for
+    // perspective-correct texturing; all of them or none
+    float fx[4] = {0, 0, 0, 0}, fy[4] = {0, 0, 0, 0}, z[4] = {0, 0, 0, 0};
+    stats.polys++;
+#ifdef PSYZ_GTE_SUBPIXEL
+    {
+        PsyzSubpixel sp[4];
+        int found = 0;
+        while (found < n && Psyz_SubpixelLookupAt(xy_word[found], x[found],
+                                                  y[found], &sp[found]))
+            found++;
+        if (found == n) {
+            for (int i = 0; i < n; i++) {
+                fx[i] = sp[i].x;
+                fy[i] = sp[i].y;
+                z[i] = 256.0f / (float)sp[i].z;
+            }
+            stats.subpixel_polys++;
+        }
+    }
+#endif
     for (int i = 0; i < n; i++) {
         uint8_t r = (uint8_t)col[i], g = (uint8_t)(col[i] >> 8),
                 b = (uint8_t)(col[i] >> 16);
-        out[i].x = MapX(x[i]);
-        out[i].y = MapY(y[i]);
+        out[i].x = MapX(x[i]) + fx[i] * scale_x;
+        out[i].y = MapY(y[i]) + fy[i] * scale_y;
+        out[i].z = z[i];
         out[i].u = BlockU(t, u[i]);
         out[i].v = BlockV(t, v[i]);
         out[i].argb = !textured ? Argb(r, g, b, mode)
                       : raw     ? Argb(255, 255, 255, mode)
                                 : TexArgb(r, g, b, mode);
     }
-    SubmitStrip(out, n, t, mode);
+    SubmitStrip(out, n, t, mode, true);
 }
 
 static void PushRect(const u_long* p, int code) {

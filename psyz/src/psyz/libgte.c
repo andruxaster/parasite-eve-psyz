@@ -2211,7 +2211,189 @@ int Psyz_GtePgxpNclip4(const void* s0, unsigned int xy0, const void* s1,
     return int_area;
 }
 
+#ifdef PSYZ_GTE_SUBPIXEL
+#include <psyz/subpixel.h>
+/* See psyz/subpixel.h. 2-way sets keyed by the packed screen position. */
+#define SUBPIXEL_SETS 2048u
+typedef struct {
+    unsigned int sxy;
+    unsigned short gen;
+    unsigned short z;
+    unsigned char fx, fy, ambiguous, used;
+} SubpixelEntry;
+static SubpixelEntry subpixel_cache[SUBPIXEL_SETS][2];
+static unsigned short subpixel_gen = 1;
+
+static inline unsigned SubpixelHash(unsigned sxy) {
+    return (sxy * 2654435761u) >> (32 - 11);
+}
+
+void Psyz_SubpixelNextFrame(void) {
+    if (++subpixel_gen == 0) {
+        memset(subpixel_cache, 0, sizeof(subpixel_cache));
+        subpixel_gen = 1;
+    }
+}
+
+// A game at 30 fps waits two vertical blanks between projecting a frame and
+// drawing it, a 20 fps one three.
+#define SUBPIXEL_FRAMES 3u
+static inline int SubpixelFresh(const SubpixelEntry* e) {
+    return e->used && (unsigned short)(subpixel_gen - e->gen) <= SUBPIXEL_FRAMES;
+}
+
+int Psyz_SubpixelLookup(int x, int y, PsyzSubpixel* out) {
+    unsigned sxy = (unsigned)(x & 0xFFFF) | ((unsigned)y << 16);
+    SubpixelEntry* set = subpixel_cache[SubpixelHash(sxy)];
+    for (int w = 0; w < 2; ++w) {
+        SubpixelEntry* e = &set[w];
+        if (e->sxy == sxy && SubpixelFresh(e)) {
+            if (e->ambiguous)
+                return 0;
+            out->x = e->fx * (1.0f / 256.0f);
+            out->y = e->fy * (1.0f / 256.0f);
+            out->z = e->z;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The subpixel data of the vertices in SXY0..SXY2, shifting with them.
+typedef struct {
+    unsigned int sxy;
+    unsigned short z;
+    unsigned char fx, fy, valid;
+} SubpixelVertex;
+static SubpixelVertex subpixel_fifo[3];
+
+// Keeps the fraction RTP_VERTEX dropped from an unsaturated SX/SY, in the
+// position cache and as the vertex's subpixel data.
+static SubpixelVertex GteSubpixelRecord(int div, int ir1, int ir2, int sx,
+                                        int sy, int sz) {
+    SubpixelVertex v = {0, 0, 0, 0, 0};
+    if (sz <= 0 || OFX + MUL_DIV_HI(div, ir1) != sx ||
+        OFY + MUL_DIV_HI(div, ir2) != sy)
+        return v;
+    unsigned fx = (((unsigned)div * (unsigned)ir1) >> 8) & 0xFF;
+    unsigned fy = (((unsigned)div * (unsigned)ir2) >> 8) & 0xFF;
+    unsigned sxy = (unsigned)(sx & 0xFFFF) | ((unsigned)sy << 16);
+    v = (SubpixelVertex){sxy, (unsigned short)sz, (unsigned char)fx,
+                         (unsigned char)fy, 1};
+    SubpixelEntry* set = subpixel_cache[SubpixelHash(sxy)];
+    SubpixelEntry* e = &set[0];
+    if (set[0].sxy == sxy && set[0].used) {
+        e = &set[0];
+    } else if (set[1].sxy == sxy && set[1].used) {
+        e = &set[1];
+    } else {
+        // replace the stale or older way
+        e = !SubpixelFresh(&set[0]) ? &set[0]
+            : !SubpixelFresh(&set[1]) ? &set[1]
+            : (short)(set[0].gen - set[1].gen) <= 0 ? &set[0] : &set[1];
+        e->used = 0;
+    }
+    if (e->used && e->gen == subpixel_gen) {
+        // the same position again this frame: a shared vertex projects the
+        // same; anything else makes the position ambiguous
+        if (e->fx != fx || e->fy != fy || e->z != sz)
+            e->ambiguous = 1;
+        return v;
+    }
+    e->sxy = sxy;
+    e->gen = subpixel_gen;
+    e->z = (unsigned short)sz;
+    e->fx = (unsigned char)fx;
+    e->fy = (unsigned char)fy;
+    e->ambiguous = 0;
+    e->used = 1;
+    return v;
+}
+
+/* Vertices by the address their SXY was stored to (gte_stsxy into a
+ * primitive): exact where positions are ambiguous. */
+#define SUBPIXEL_ADDR_SETS 4096u
+typedef struct {
+    uintptr_t addr;
+    SubpixelVertex v;
+    unsigned short gen;
+} SubpixelAddr;
+static SubpixelAddr subpixel_addr[SUBPIXEL_ADDR_SETS][2];
+
+static inline SubpixelAddr* SubpixelAddrSet(const void* p) {
+    uintptr_t a = (uintptr_t)p;
+    return subpixel_addr[((a >> 2) ^ (a >> 14)) & (SUBPIXEL_ADDR_SETS - 1u)];
+}
+
+static void SubpixelStoreAt(const void* dst, const SubpixelVertex* v) {
+    SubpixelAddr* set = SubpixelAddrSet(dst);
+    SubpixelAddr* e = set[0].addr == (uintptr_t)dst ? &set[0]
+                      : set[1].addr == (uintptr_t)dst ? &set[1]
+                      : (unsigned short)(subpixel_gen - set[0].gen) >=
+                              (unsigned short)(subpixel_gen - set[1].gen)
+                          ? &set[0]
+                          : &set[1];
+    if (!v) {
+        if (e->addr == (uintptr_t)dst)
+            e->v.valid = 0;
+        return;
+    }
+    e->addr = (uintptr_t)dst;
+    e->v = *v;
+    e->gen = subpixel_gen;
+}
+
+int Psyz_SubpixelLookupAt(const void* packet_word, int x, int y,
+                          PsyzSubpixel* out) {
+    unsigned sxy = (unsigned)(x & 0xFFFF) | ((unsigned)y << 16);
+    SubpixelAddr* set = SubpixelAddrSet(packet_word);
+    for (int w = 0; w < 2; ++w) {
+        SubpixelAddr* e = &set[w];
+        if (e->addr == (uintptr_t)packet_word && e->v.valid &&
+            e->v.sxy == sxy &&
+            (unsigned short)(subpixel_gen - e->gen) <= SUBPIXEL_FRAMES) {
+            out->x = e->v.fx * (1.0f / 256.0f);
+            out->y = e->v.fy * (1.0f / 256.0f);
+            out->z = e->v.z;
+            return 1;
+        }
+    }
+    return Psyz_SubpixelLookup(x, y, out);
+}
+
+#define RTP_SUBPIXEL_AT(i)                                                     \
+    (subpixel_fifo[i] =                                                        \
+         GteSubpixelRecord(rt_div, rt_ir1, rt_ir2, rt_sx, rt_sy, rt_sz))
+#define RTP_SUBPIXEL_SHIFT()                                                   \
+    do {                                                                       \
+        subpixel_fifo[0] = subpixel_fifo[1];                                   \
+        subpixel_fifo[1] = subpixel_fifo[2];                                   \
+        RTP_SUBPIXEL_AT(2);                                                    \
+    } while (0)
+#else
+#define RTP_SUBPIXEL_AT(i) ((void)0)
+#define RTP_SUBPIXEL_SHIFT() ((void)0)
+#endif
+
 void Psyz_GteCopyPgxpSxy(const void* src, const void* dst, unsigned int sxy) {
+#ifdef PSYZ_GTE_SUBPIXEL
+    if (dst) {
+        // the vertex copied from src into a primitive keeps its subpixel data
+        const SubpixelVertex* v = NULL;
+        if (src) {
+            SubpixelAddr* set = SubpixelAddrSet(src);
+            for (int w = 0; w < 2 && !v; ++w)
+                if (set[w].addr == (uintptr_t)src && set[w].v.valid &&
+                    set[w].v.sxy == sxy &&
+                    (unsigned short)(subpixel_gen - set[w].gen) <= SUBPIXEL_FRAMES)
+                    v = &set[w].v;
+        }
+        SubpixelVertex copy;
+        if (v)
+            copy = *v;
+        SubpixelStoreAt(dst, v ? &copy : NULL);
+    }
+#endif
     if (!pgxp_active || !dst) {
         return;
     }
@@ -2301,6 +2483,7 @@ void Psyz_GteCopyQueuedPgxpSxy(
         IR3 = (short)rt_ir3;                                                   \
     } while (0)
 
+
 // RTPS on V0. sxy gets the packed screen XY,o callers never read back SX2/SY2.
 #define RTPS_BODY(sf, lm, sxy)                                                 \
     do {                                                                       \
@@ -2310,6 +2493,7 @@ void Psyz_GteCopyQueuedPgxpSxy(
         RTP_VERTEX(sf, lm, V0.vx, V0.vy, V0.vz, FLAG, rt_div, rt_mac1,         \
                    rt_mac2, rt_mac3, rt_ir1, rt_ir2, rt_ir3, rt_sx, rt_sy,     \
                    rt_sz);                                                     \
+        RTP_SUBPIXEL_SHIFT();                                                        \
         SZ0 = SZ1;                                                             \
         SZ1 = SZ2;                                                             \
         SZ2 = SZ3;                                                             \
@@ -2344,6 +2528,7 @@ void Psyz_GteCopyQueuedPgxpSxy(
         RTP_VERTEX(sf, lm, V0.vx, V0.vy, V0.vz, FLAG, rt_div, rt_mac1,         \
                    rt_mac2, rt_mac3, rt_ir1, rt_ir2, rt_ir3, rt_sx, rt_sy,     \
                    rt_sz);                                                     \
+        RTP_SUBPIXEL_AT(0);                                                        \
         SZ1 = (unsigned short)rt_sz;                                           \
         SX0 = (short)rt_sx;                                                    \
         SY0 = (short)rt_sy;                                                    \
@@ -2355,6 +2540,7 @@ void Psyz_GteCopyQueuedPgxpSxy(
         RTP_VERTEX(sf, lm, V1.vx, V1.vy, V1.vz, FLAG, rt_div, rt_mac1,         \
                    rt_mac2, rt_mac3, rt_ir1, rt_ir2, rt_ir3, rt_sx, rt_sy,     \
                    rt_sz);                                                     \
+        RTP_SUBPIXEL_AT(1);                                                        \
         SZ2 = (unsigned short)rt_sz;                                           \
         SX1 = (short)rt_sx;                                                    \
         SY1 = (short)rt_sy;                                                    \
@@ -2366,6 +2552,7 @@ void Psyz_GteCopyQueuedPgxpSxy(
         RTP_VERTEX(sf, lm, V2.vx, V2.vy, V2.vz, FLAG, rt_div, rt_mac1,         \
                    rt_mac2, rt_mac3, rt_ir1, rt_ir2, rt_ir3, rt_sx, rt_sy,     \
                    rt_sz);                                                     \
+        RTP_SUBPIXEL_AT(2);                                                        \
         SZ3 = (unsigned short)rt_sz;                                           \
         SX2 = (short)rt_sx;                                                    \
         SY2 = (short)rt_sy;                                                    \
@@ -3464,6 +3651,17 @@ unsigned int Psyz_GteDataRead(unsigned idx) {
 void Psyz_GteStoreSxyTo(unsigned reg, void* dst) {
     unsigned int word = Psyz_GteDataRead(reg);
     memcpy(dst, &word, 4);
+#ifdef PSYZ_GTE_SUBPIXEL
+    {
+        const SubpixelVertex* v = NULL;
+        if (reg >= 12u && reg <= 15u) {
+            v = &subpixel_fifo[reg == 15u ? 2u : reg - 12u];
+            if (!v->valid || v->sxy != word)
+                v = NULL;
+        }
+        SubpixelStoreAt(dst, v);
+    }
+#endif
     if (pgxp_active && reg >= 12u && reg <= 15u) {
         unsigned int fifo_idx = reg == 15u ? 2u : (reg - 12u);
         PgxpSxyEntry entry = pgxp_fifo[fifo_idx];
