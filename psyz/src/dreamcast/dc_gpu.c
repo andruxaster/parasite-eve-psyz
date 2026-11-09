@@ -133,6 +133,7 @@ typedef struct TexSlot {
     // stale_outside, and the block is decoded again if drawing ever
     // reaches past the used box
     int16_t used_u0, used_v0, used_u1, used_v1;
+    float inv_w, inv_h; // 1 / w, 1 / h: exact, as both are powers of two
     uint8_t cls;
     uint8_t wrap_u, wrap_v; // texture window period - 1 (255: none)
     uint8_t hdr_mode; // blend mode * 2 + filter of hdr
@@ -204,8 +205,16 @@ static int frame24_hdr_h;
 static bool frame24_dirty = true;
 static int cur_hdr = -1; // slot index * BLEND_MODES + mode, or -1 - mode
 
+// ceil(log2(v)) for 1 <= v <= 512 (texture block sizes); the SH-4 has no
+// count-leading-zeros instruction
 static inline int Log2(int v) {
-    int l = 0;
+    static const uint8_t table[33] = {0, 0, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4,
+                                      4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5,
+                                      5, 5, 5, 5, 5, 5, 5, 5, 5};
+    if (v <= 32) {
+        return table[v < 0 ? 0 : v];
+    }
+    int l = 6;
     while ((1 << l) < v) {
         l++;
     }
@@ -507,6 +516,8 @@ static TexSlot* UseSlot(TexSlot* s, uint64_t key, const Block* b) {
         s->v0 = (uint16_t)b->v0;
         s->w = (uint16_t)b->w;
         s->h = (uint16_t)b->h;
+        s->inv_w = 1.0f / (float)b->w;
+        s->inv_h = 1.0f / (float)b->h;
         s->wrap_u = (uint8_t)(b->wu ? (1 << b->wu) - 1 : 255);
         s->wrap_v = (uint8_t)(b->wv ? (1 << b->wv) - 1 : 255);
         s->hdr_mode = HDR_NONE;
@@ -672,8 +683,59 @@ static TexSlot* FindWindowTexture(u16 tpage, u16 clut, int umin, int vmin,
 // [umin, umax] x [vmin, vmax]: the page+CLUT's region block when it has one
 // that holds the box, otherwise the smallest block that does. A box past
 // the page edge takes the whole page, which repeats.
+static TexSlot* FindTextureSlow(u16 tpage, u16 clut, int variant, int umin,
+                                int vmin, int umax, int vmax);
+
+// The block found last for each page+CLUT and 16x16 cell of the texels'
+// first corner (a direct-mapped table):
+// when a primitive reads only texels that block already holds (and nothing
+// has written them since), it is the answer, as the full search would find.
+// Primitives mostly reuse a texture: a model's material, a background's
+// tiles (often many of one page and CLUT), frame after frame.
+#define FIND_CACHE 1024
+static struct {
+    TexSlot* slot;
+    uint64_t key;
+    u16 tpage, clut;
+    uint16_t cell;
+    uint8_t variant;
+} find_cache[FIND_CACHE];
+
 static TexSlot* FindTexture(u16 tpage, u16 clut, int variant, int umin,
                             int vmin, int umax, int vmax) {
+    unsigned cell = (unsigned)(umin >> 4 & 15) | (unsigned)(vmin >> 4 & 15) << 4;
+    unsigned h = ((unsigned)clut * 0x9E3779B1u ^ (unsigned)tpage * 0x85EBCA6Bu ^
+                  cell * 0xC2B2AE35u ^ (unsigned)variant) >>
+                 22;
+    TexSlot* s = find_cache[h].slot;
+    if (s && find_cache[h].tpage == tpage && find_cache[h].clut == clut &&
+        find_cache[h].cell == cell && find_cache[h].variant == variant &&
+        s->key == find_cache[h].key &&
+        s->valid && !s->dirty && !(tex_window.log2_u | tex_window.log2_v) &&
+        umin >= s->used_u0 && vmin >= s->used_v0 && umax <= s->used_u1 &&
+        vmax <= s->used_v1) {
+        req_u0 = umin;
+        req_v0 = vmin;
+        req_u1 = umax;
+        req_v1 = vmax;
+        if (s->used_frame != frame_no) { // drawn this frame: keep it
+            s->used_frame = frame_no;
+            s->last_used = ++tex_clock;
+        }
+        return s;
+    }
+    s = FindTextureSlow(tpage, clut, variant, umin, vmin, umax, vmax);
+    find_cache[h].slot = s;
+    find_cache[h].key = s ? s->key : 0;
+    find_cache[h].tpage = tpage;
+    find_cache[h].clut = clut;
+    find_cache[h].cell = (uint16_t)cell;
+    find_cache[h].variant = (uint8_t)variant;
+    return s;
+}
+
+static TexSlot* FindTextureSlow(u16 tpage, u16 clut, int variant, int umin,
+                                int vmin, int umax, int vmax) {
     if (variant == 0 && (tex_window.log2_u || tex_window.log2_v)) {
         return FindWindowTexture(tpage, clut, umin, vmin, umax, vmax);
     }
@@ -854,13 +916,13 @@ static inline float BlockU(const TexSlot* s, int t) {
     if (!s) {
         return t / 256.0f;
     }
-    return (float)(s->wrap_u != 255 ? t : t - s->u0) / (float)s->w;
+    return (float)(s->wrap_u != 255 ? t : t - s->u0) * s->inv_w;
 }
 static inline float BlockV(const TexSlot* s, int t) {
     if (!s) {
         return t / 256.0f;
     }
-    return (float)(s->wrap_v != 255 ? t : t - s->v0) / (float)s->h;
+    return (float)(s->wrap_v != 255 ? t : t - s->v0) * s->inv_h;
 }
 
 // ===== frame =====
@@ -1266,9 +1328,31 @@ static int ClipEdge(const Vtx* in, int n, Vtx* out, bool on_x, float limit,
 // The part of strip `v` inside the drawing area, in strip order in `out`:
 // returns its vertex count (0: nothing left), or -1 when all of it is inside
 static int ClipToArea(const Vtx* v, int n, Vtx* out) {
-    float x0 = (float)(draw_area_start.x - fb_origin.x) * scale_x;
-    float x1 = (float)(draw_area_end.x + 1 - fb_origin.x) * scale_x;
-    float y0 = FbY(draw_area_start.y), y1 = FbY(draw_area_end.y + 1);
+    // the area in screen coordinates, worked out again when it moves
+    static struct {
+        int sx, sy, ex, ey, ox, oy, top;
+        float scale_x, scale_y;
+        float x0, y0, x1, y1;
+    } c = {.sx = -1};
+    if (c.sx != draw_area_start.x || c.sy != draw_area_start.y ||
+        c.ex != draw_area_end.x || c.ey != draw_area_end.y ||
+        c.ox != fb_origin.x || c.oy != fb_origin.y || c.top != disp_top ||
+        c.scale_x != scale_x || c.scale_y != scale_y) {
+        c.sx = draw_area_start.x;
+        c.sy = draw_area_start.y;
+        c.ex = draw_area_end.x;
+        c.ey = draw_area_end.y;
+        c.ox = fb_origin.x;
+        c.oy = fb_origin.y;
+        c.top = disp_top;
+        c.scale_x = scale_x;
+        c.scale_y = scale_y;
+        c.x0 = (float)(draw_area_start.x - fb_origin.x) * scale_x;
+        c.x1 = (float)(draw_area_end.x + 1 - fb_origin.x) * scale_x;
+        c.y0 = FbY(draw_area_start.y);
+        c.y1 = FbY(draw_area_end.y + 1);
+    }
+    float x0 = c.x0, x1 = c.x1, y0 = c.y0, y1 = c.y1;
     float bx0 = v[0].x, bx1 = v[0].x, by0 = v[0].y, by1 = v[0].y;
     for (int i = 1; i < n; i++) {
         bx0 = v[i].x < bx0 ? v[i].x : bx0;
@@ -1890,13 +1974,22 @@ static void PushPoly(const u_long* p, int code) {
                         vmax > vmin ? vmax - 1 : vmax);
     }
     Vtx out[4];
-    // vertices the GTE projected: between pixels, with depth for
-    // perspective-correct texturing; all of them or none
-    float fx[4] = {0, 0, 0, 0}, fy[4] = {0, 0, 0, 0}, z[4] = {0, 0, 0, 0};
     stats.polys++;
     (void)xy_word; // read only with PSYZ_GTE_SUBPIXEL
+    // screen position: (x + offset) * scale, the offset added once
+    const float ox = (float)(draw_offset.x - fb_origin.x);
+    const float oy = (float)(draw_offset.y - fb_origin.y + disp_top);
+    for (int i = 0; i < n; i++) {
+        out[i].x = ((float)x[i] + ox) * scale_x;
+        out[i].y = ((float)y[i] + oy) * scale_y;
+        out[i].z = 0.0f;
+        out[i].u = BlockU(t, u[i]);
+        out[i].v = BlockV(t, v[i]);
+    }
 #ifdef PSYZ_GTE_SUBPIXEL
     {
+        // vertices the GTE projected: between pixels, with depth for
+        // perspective-correct texturing; all of them or none
         PsyzSubpixel sp[4];
         int found = 0;
         while (found < n && Psyz_SubpixelLookupAt(xy_word[found], x[found],
@@ -1904,25 +1997,30 @@ static void PushPoly(const u_long* p, int code) {
             found++;
         if (found == n) {
             for (int i = 0; i < n; i++) {
-                fx[i] = sp[i].x;
-                fy[i] = sp[i].y;
-                z[i] = 256.0f / (float)sp[i].z;
+                out[i].x += sp[i].x * scale_x;
+                out[i].y += sp[i].y * scale_y;
+                out[i].z = 256.0f / (float)sp[i].z;
             }
             stats.subpixel_polys++;
         }
     }
 #endif
-    for (int i = 0; i < n; i++) {
-        uint8_t r = (uint8_t)col[i], g = (uint8_t)(col[i] >> 8),
-                b = (uint8_t)(col[i] >> 16);
-        out[i].x = MapX(x[i]) + fx[i] * scale_x;
-        out[i].y = MapY(y[i]) + fy[i] * scale_y;
-        out[i].z = z[i];
-        out[i].u = BlockU(t, u[i]);
-        out[i].v = BlockV(t, v[i]);
-        out[i].argb = !textured ? Argb(r, g, b, mode)
-                      : raw     ? Argb(255, 255, 255, mode)
-                                : TexArgb(r, g, b, mode);
+    if (!gouraud || raw) { // one colour
+        uint8_t r = (uint8_t)col[0], g = (uint8_t)(col[0] >> 8),
+                b = (uint8_t)(col[0] >> 16);
+        uint32_t c = !textured ? Argb(r, g, b, mode)
+                     : raw     ? Argb(255, 255, 255, mode)
+                               : TexArgb(r, g, b, mode);
+        for (int i = 0; i < n; i++) {
+            out[i].argb = c;
+        }
+    } else {
+        for (int i = 0; i < n; i++) {
+            uint8_t r = (uint8_t)col[i], g = (uint8_t)(col[i] >> 8),
+                    b = (uint8_t)(col[i] >> 16);
+            out[i].argb =
+                textured ? TexArgb(r, g, b, mode) : Argb(r, g, b, mode);
+        }
     }
     SubmitStrip(out, n, t, mode, false);
 }

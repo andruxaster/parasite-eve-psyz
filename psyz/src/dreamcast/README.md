@@ -35,7 +35,9 @@ the desktop software renderer. Not yet on hardware or in an emulator.
   vertex buffers (about 5 MB); the 16x16 pool holds room backgrounds, which
   are drawn as hundreds of 16x16 tiles, each often with its own CLUT. A page+CLUT that misses several small blocks in a
   frame, such as a model part drawn as many triangles, gets one region
-  block over all the UVs drawn with it. A slot tracks the texels actually
+  block over all the UVs drawn with it. The block found last for each
+  page, CLUT and 16x16 cell is remembered, so a primitive whose texels it
+  already holds skips the search (most of them, frame after frame). A slot tracks the texels actually
   drawn from it, so only writes there make it dirty (page 15 wraps into
   the framebuffer, which is cleared every frame). A slot drawn in the
   current frame is never overwritten: the PVR reads textures when it
