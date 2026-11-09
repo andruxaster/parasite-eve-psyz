@@ -128,10 +128,14 @@ typedef struct TexSlot {
     // reaches past the used box
     int16_t used_u0, used_v0, used_u1, used_v1;
     uint8_t cls;
+    uint8_t dirty_why; // DIRTY_*: why it is decoded next (statistics)
     bool valid;
     bool dirty;
     bool stale_outside;
 } TexSlot;
+
+// why a slot is decoded
+enum { DIRTY_NEW, DIRTY_CLUT, DIRTY_TEXELS, DIRTY_OUTSIDE, DIRTY_REASONS };
 
 typedef struct {
     int cls;
@@ -169,6 +173,8 @@ static PageStat page_stats[PAGE_STATS];
 static struct {
     uint32_t decodes, decoded_texels, overwrites, vertices, frames;
     uint32_t class_decodes[TEX_CLASSES];
+    uint32_t why[4];          // decodes by DIRTY_* reason
+    uint32_t writes, changed; // VRAM writes; those that changed anything
     uint32_t polys, subpixel_polys; // polygons; those placed between pixels
     uint64_t decode_us, start_us;
     uint64_t pvr_wait_us; // pvr_wait_ready: the PVR still drawing
@@ -277,6 +283,19 @@ static bool HitsWrapped(int x, int y, int w, int h, int bx, int by, int bw,
            Overlaps(x, y, w, h, 0, by, bx + bw - VRAM_W, bh);
 }
 
+static void InvalidateVram(int x, int y, int w, int h);
+
+// A write that changed rows first..last of a w-wide rectangle at x, y (none
+// when last < first): games upload the same CLUTs and textures frame after
+// frame, and only a real change needs blocks decoded again.
+static void InvalidateChanged(int x, int y, int w, int first, int last) {
+    stats.writes++;
+    if (last < first)
+        return;
+    stats.changed++;
+    InvalidateVram(x, y + first, w, last - first + 1);
+}
+
 static void InvalidateVram(int x, int y, int w, int h) {
     memo_slot = NULL;
     frame24_dirty = true;
@@ -292,6 +311,7 @@ static void InvalidateVram(int x, int y, int w, int h) {
             int cy = (int)(clut >> 6) & 0x1FF;
             if (Overlaps(x, y, w, h, cx, cy, bpp ? 256 : 16, 1)) {
                 s->dirty = true;
+                s->dirty_why = DIRTY_CLUT;
                 continue;
             }
         }
@@ -300,6 +320,7 @@ static void InvalidateVram(int x, int y, int w, int h) {
                      &by, &bw, &bh);
         if (HitsWrapped(x, y, w, h, bx, by, bw, bh)) {
             s->dirty = true;
+            s->dirty_why = DIRTY_TEXELS;
             continue;
         }
         if (!s->stale_outside) {
@@ -454,6 +475,7 @@ static TexSlot* UseSlot(TexSlot* s, uint64_t key, const Block* b) {
         }
         s->valid = true;
         s->dirty = true;
+        s->dirty_why = DIRTY_NEW;
         s->key = key;
         s->u0 = (uint16_t)b->u0;
         s->v0 = (uint16_t)b->v0;
@@ -463,10 +485,12 @@ static TexSlot* UseSlot(TexSlot* s, uint64_t key, const Block* b) {
     }
     bool beyond = req_u0 < s->used_u0 || req_v0 < s->used_v0 ||
                   req_u1 > s->used_u1 || req_v1 > s->used_v1;
-    if (beyond && s->stale_outside) {
+    if (beyond && s->stale_outside && !s->dirty) {
         s->dirty = true;
+        s->dirty_why = DIRTY_OUTSIDE;
     }
     if (s->dirty) {
+        stats.why[s->dirty_why]++;
         DecodeSlot(s);
         s->dirty = false;
         s->stale_outside = false;
@@ -815,7 +839,9 @@ static void EndScene(void) {
         INFOF("gpu: %u frames in %u ms (%u.%u fps), %u verts/frame, "
               "%u decodes (%u Ktexels, %u ms), %u in-frame overwrites; "
               "waiting for PVR %u ms, idle in vblank %u ms, movie upload "
-              "%u ms; decodes by pool 1K/4K/16K/32K/64K %u/%u/%u/%u/%u",
+              "%u ms; decodes by pool 1K/4K/16K/32K/64K %u/%u/%u/%u/%u, "
+              "new/clut/texels/outside %u/%u/%u/%u; VRAM writes %u, "
+              "%u changed",
               stats.frames, ms, ms ? stats.frames * 1000u / ms : 0,
               ms ? stats.frames * 10000u / ms % 10 : 0,
               stats.vertices / stats.frames, stats.decodes,
@@ -826,7 +852,8 @@ static void EndScene(void) {
               (uint32_t)(stats.movie_us / 1000u),
               stats.class_decodes[0], stats.class_decodes[1],
               stats.class_decodes[2], stats.class_decodes[3],
-              stats.class_decodes[4]);
+              stats.class_decodes[4], stats.why[0], stats.why[1],
+              stats.why[2], stats.why[3], stats.writes, stats.changed);
         memset(&stats, 0, sizeof(stats));
         stats.start_us = now;
     }
@@ -1349,13 +1376,18 @@ void Draw_ClearImage(RECT* rect, u_char r, u_char g, u_char b) {
         return;
     }
     uint16_t c = (uint16_t)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
+    int first = h, last = -1;
     for (int row = 0; row < h; ++row) {
         uint16_t* dst = &vram[(y + row) * VRAM_W + x];
         for (int col = 0; col < w; ++col) {
-            dst[col] = c;
+            if (dst[col] != c) {
+                first = row < first ? row : first;
+                last = row;
+                dst[col] = c;
+            }
         }
     }
-    InvalidateVram(x, y, w, h);
+    InvalidateChanged(x, y, w, first, last);
     EmitFill(x, y, w, h, r, g, b);
 }
 
@@ -1373,10 +1405,16 @@ void Draw_LoadImage(RECT* rect, u_long* p) {
     }
 #endif
     const uint16_t* src = (const uint16_t*)p;
+    int first = h, last = -1;
     for (int row = 0; row < h; ++row) {
-        memcpy(&vram[(y + row) * VRAM_W + x], src + row * rect->w, w * 2);
+        uint16_t* dst = &vram[(y + row) * VRAM_W + x];
+        if (memcmp(dst, src + row * rect->w, w * 2)) {
+            first = row < first ? row : first;
+            last = row;
+            memcpy(dst, src + row * rect->w, w * 2);
+        }
     }
-    InvalidateVram(x, y, w, h);
+    InvalidateChanged(x, y, w, first, last);
     EmitVramRegionQuad(x, y, w, h);
 }
 
@@ -1404,12 +1442,18 @@ void Draw_MoveImage(RECT* rect, unsigned int x, unsigned int y) {
     if (y + h > VRAM_H) {
         h = VRAM_H - y;
     }
+    int first = h, last = -1;
     for (int row = 0; row < h; ++row) {
         int r = y > (unsigned)sy ? h - 1 - row : row;
-        memmove(&vram[(y + r) * VRAM_W + x], &vram[(sy + r) * VRAM_W + sx],
-                w * 2);
+        uint16_t* dst = &vram[(y + r) * VRAM_W + x];
+        const uint16_t* from = &vram[(sy + r) * VRAM_W + sx];
+        if (memcmp(dst, from, w * 2)) {
+            first = r < first ? r : first;
+            last = r > last ? r : last;
+            memmove(dst, from, w * 2);
+        }
     }
-    InvalidateVram((int)x, (int)y, w, h);
+    InvalidateChanged((int)x, (int)y, w, first, last);
     EmitVramRegionQuad((int)x, (int)y, w, h);
 }
 
