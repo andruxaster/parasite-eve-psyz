@@ -1493,11 +1493,14 @@ static void PushPoly(const u_long* p, int code) {
     int mode = BlendMode(semitrans, tpage);
     TexSlot* t = NULL;
     if (textured) {
-        // flipped UVs on the PS1 sample one texel further
-        bool fix_u = ((x[0] > x[1]) ^ (u[0] > u[1])) |
-                     ((x[0] > x[2]) ^ (u[0] > u[2]));
-        bool fix_v = ((y[0] > y[1]) ^ (v[0] > v[1])) |
-                     ((y[0] > y[2]) ^ (v[0] > v[2]));
+        // flipped UVs on the PS1 sample one texel further; only an edge
+        // along which the coordinate changes can be flipped (a polygon with
+        // one U, such as a hand coloured from a single texel, samples it
+        // whichever way it faces)
+        bool fix_u = (u[0] != u[1] && ((x[0] > x[1]) ^ (u[0] > u[1]))) |
+                     (u[0] != u[2] && ((x[0] > x[2]) ^ (u[0] > u[2])));
+        bool fix_v = (v[0] != v[1] && ((y[0] > y[1]) ^ (v[0] > v[1]))) |
+                     (v[0] != v[2] && ((y[0] > y[2]) ^ (v[0] > v[2])));
         int umin = 1 << 30, umax = -1, vmin = 1 << 30, vmax = -1;
         for (int i = 0; i < n; i++) {
             u[i] += fix_u;
