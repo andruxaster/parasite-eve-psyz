@@ -71,9 +71,15 @@ static void Tri(const pvr_vertex_t *a, const pvr_vertex_t *b, const pvr_vertex_t
         float sa = col[0], s[3] = {col[1], col[2], col[3]};
         if (x->txr.enable) {
             float u = w0 * a->u + w1 * b->u + w2 * c->u, v = w0 * a->v + w1 * b->v + w2 * c->v;
-            int tu = (int)floorf(u * 256) & 255, tv = (int)floorf(v * 256) & 255;
-            uint16_t t = ((uint16_t *)x->txr.base)[tv * 256 + tu];
-            float ta = (t >> 15) & 1, tr = ((t >> 10) & 31) / 31.f, tg = ((t >> 5) & 31) / 31.f, tb = (t & 31) / 31.f;
+            int tw = x->txr.width, th = x->txr.height;
+            int tu = (int)floorf(u * tw) & (tw - 1), tv = (int)floorf(v * th) & (th - 1);
+            uint16_t t = ((uint16_t *)x->txr.base)[tv * tw + tu];
+            float ta, tr, tg, tb;
+            if (x->txr.format & PVR_TXRFMT_RGB565) {
+                ta = 1; tr = ((t >> 11) & 31) / 31.f; tg = ((t >> 5) & 63) / 63.f; tb = (t & 31) / 31.f;
+            } else {
+                ta = (t >> 15) & 1; tr = ((t >> 10) & 31) / 31.f; tg = ((t >> 5) & 31) / 31.f; tb = (t & 31) / 31.f;
+            }
             s[0] *= tr; s[1] *= tg; s[2] *= tb;
             if (!x->txr.alpha) sa *= ta;
         }

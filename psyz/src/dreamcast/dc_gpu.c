@@ -15,11 +15,15 @@
 // Coordinates are mapped from the PS1 framebuffer (256-640 x 240/480) to the
 // 640x480 Dreamcast screen.
 //
+// In 24-bit display mode (the MDEC movies) the displayed VRAM rectangle holds
+// packed RGB888; it is converted to an RGB565 texture and shown whole at
+// VSync, and primitives are not drawn.
+//
 // Not emulated yet: drawing into VRAM and sampling it back as a texture,
 // reading rendered pixels with StoreImage/MoveImage, the draw-area clip,
 // texture windows, mask bits, dithering, per-texel STP for semi-transparent
-// primitives (the whole primitive blends), true subtractive blending (mode 2
-// is approximated as B*(1-F)) and brightening above 0x80 on textured colors.
+// primitives (the whole primitive blends) and brightening above 0x80 on
+// textured colors. Subtractive blending (mode 2) takes three passes.
 #include <psyz.h>
 #include <psyz/log.h>
 #include <libgpu.h>
@@ -41,6 +45,14 @@ static uint16_t vram[VRAM_W * VRAM_H] __attribute__((aligned(32)));
 // ===== state =====
 static bool is_init;
 static bool display_enabled = true;
+static bool rgb24;
+static struct {
+    int x, y;
+} disp_area;
+// visible lines from the display vertical range: the PS1 shows `disp_lines`
+// framebuffer rows starting `disp_top` lines below the standard 240-line
+// window (NTSC range start 16)
+static int disp_top, disp_lines = 240;
 static int game_w = 320, game_h = 240;
 static float scale_x = SCREEN_W / 320.0f, scale_y = SCREEN_H / 240.0f;
 static u16 cur_tpage;
@@ -62,10 +74,12 @@ static uint32_t frame_no;
 static int frame_vertices;
 static uint64_t boot_us;
 
-// blend modes: 0-3 are the PS1 semi-transparency modes, 4 is opaque
+// blend modes: 0-3 are the PS1 semi-transparency modes, 4 is opaque, 5
+// inverts the framebuffer (used for mode 2)
 #define BLEND_OPAQUE 4
-#define BLEND_MODES 5
-static const uint8_t blend_alpha[BLEND_MODES] = {128, 255, 255, 64, 255};
+#define BLEND_INVERT 5
+#define BLEND_MODES 6
+static const uint8_t blend_alpha[BLEND_MODES] = {128, 255, 255, 64, 255, 255};
 
 // ===== texture cache =====
 #define TEX_SLOTS_MAX 32
@@ -89,6 +103,14 @@ static uint32_t tex_clock;
 static TexSlot* memo_slot;
 static uint32_t memo_key;
 static pvr_poly_hdr_t col_hdr[BLEND_MODES];
+
+// 24-bit display: the whole picture as one RGB565 texture
+#define FRAME24_W 512
+#define FRAME24_H 512
+static pvr_ptr_t frame24;
+static pvr_poly_hdr_t frame24_hdr;
+static int frame24_hdr_h;
+static bool frame24_dirty = true;
 static int cur_hdr = -1; // slot index * BLEND_MODES + mode, or -1 - mode
 
 static inline uint32_t TexKey(u16 tpage, u16 clut, int variant) {
@@ -116,6 +138,7 @@ static inline bool Overlaps(
 
 static void InvalidateVram(int x, int y, int w, int h) {
     memo_slot = NULL;
+    frame24_dirty = true;
     for (int i = 0; i < tex_slot_count; i++) {
         TexSlot* s = &tex_slots[i];
         if (!s->valid || s->dirty) {
@@ -256,12 +279,13 @@ static TexSlot* FindTexture(u16 tpage, u16 clut, int variant) {
     return s;
 }
 
-static void CompileHeader(pvr_poly_hdr_t* hdr, pvr_ptr_t txr, int mode) {
+static void CompileHeaderFmt(pvr_poly_hdr_t* hdr, pvr_ptr_t txr, int fmt,
+                             int w, int h, int mode) {
     pvr_poly_cxt_t cxt;
     if (txr) {
         pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY,
-                         PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED, 256,
-                         256, txr, PVR_FILTER_NONE);
+                         fmt | PVR_TXRFMT_NONTWIDDLED, w, h, txr,
+                         PVR_FILTER_NONE);
         cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
         cxt.txr.alpha = false; // false enables the texture's alpha
         cxt.txr.uv_clamp = PVR_UVCLAMP_NONE;
@@ -284,13 +308,20 @@ static void CompileHeader(pvr_poly_hdr_t* hdr, pvr_ptr_t txr, int mode) {
         cxt.blend.src = PVR_BLEND_SRCALPHA;
         cxt.blend.dst = PVR_BLEND_ONE;
         break;
-    case 2: // B - F, approximated as B * (1 - F); as a destination factor
-            // INVDESTCOLOR selects the inverse source colour
-        cxt.blend.src = PVR_BLEND_ZERO;
-        cxt.blend.dst = PVR_BLEND_INVDESTCOLOR;
+    case 2: // drawn by SubmitStrip as invert, add, invert
+        cxt.blend.src = PVR_BLEND_SRCALPHA;
+        cxt.blend.dst = PVR_BLEND_ONE;
+        break;
+    case BLEND_INVERT: // 1 - B
+        cxt.blend.src = PVR_BLEND_INVDESTCOLOR;
+        cxt.blend.dst = PVR_BLEND_ZERO;
         break;
     }
     pvr_poly_compile(hdr, &cxt);
+}
+
+static void CompileHeader(pvr_poly_hdr_t* hdr, pvr_ptr_t txr, int mode) {
+    CompileHeaderFmt(hdr, txr, PVR_TXRFMT_ARGB1555, 256, 256, mode);
 }
 
 static void SendHeader(TexSlot* t, int mode) {
@@ -334,6 +365,7 @@ static bool InitPlatform(void) {
         return false;
     }
     pvr_set_bg_color(0.0f, 0.0f, 0.0f);
+    frame24 = pvr_mem_malloc(FRAME24_W * FRAME24_H * 2);
     size_t avail = pvr_mem_available();
     size_t reserve = 256 * 1024;
     tex_slot_count = avail > reserve ? (int)((avail - reserve) / TEX_BYTES) : 0;
@@ -374,13 +406,69 @@ static void BeginScene(void) {
     fb_origin_locked = false;
 }
 
+static void MaskBorders(void);
+
 static void EndScene(void) {
     if (!in_scene) {
         return;
     }
+    MaskBorders();
     pvr_list_finish();
     pvr_scene_finish();
     in_scene = false;
+}
+
+
+// 24-bit display: convert the displayed RGB888 rectangle and show it whole
+static void Present24(void) {
+    if (!display_enabled || !frame24 || !frame24_dirty) {
+        return; // the PVR keeps showing the previous picture
+    }
+    int w = game_w > FRAME24_W ? FRAME24_W : game_w;
+    int vis = game_h > 240 ? disp_lines * 2 : disp_lines;
+    int h = vis > FRAME24_H ? FRAME24_H : vis;
+    float top = (float)(game_h > 240 ? disp_top * 2 : disp_top) * scale_y;
+    int tex_h = h > 256 ? 512 : 256;
+    BeginScene(); // waits for the previous render, which read frame24
+    for (int y = 0; y < h; y++) {
+        const uint8_t* src = (const uint8_t*)&vram[((disp_area.y + y) &
+                                                    (VRAM_H - 1)) * VRAM_W];
+        src += disp_area.x * 2;
+        uint32_t* dst = (uint32_t*)((uint16_t*)frame24 + y * FRAME24_W);
+        for (int x = 0; x < w; x += 2, src += 6) {
+            uint32_t a = ((src[0] >> 3) << 11) | ((src[1] >> 2) << 5) |
+                         (src[2] >> 3);
+            uint32_t b = ((src[3] >> 3) << 11) | ((src[4] >> 2) << 5) |
+                         (src[5] >> 3);
+            *dst++ = a | (b << 16);
+        }
+    }
+    frame24_dirty = false;
+    if (frame24_hdr_h != tex_h) {
+        CompileHeaderFmt(&frame24_hdr, frame24, PVR_TXRFMT_RGB565, FRAME24_W,
+                         tex_h, BLEND_OPAQUE);
+        frame24_hdr_h = tex_h;
+    }
+    cur_hdr = -100; // a header no cache entry matches
+    pvr_prim(&frame24_hdr, sizeof(frame24_hdr));
+    uint32_t c = 0xFFFFFFFF;
+    float u1 = (float)w / FRAME24_W, v1 = (float)h / tex_h;
+    pvr_vertex_t out = {0};
+    out.z = 1.0f;
+    out.argb = c;
+    const float xs[4] = {0, SCREEN_W, 0, SCREEN_W};
+    float bottom = top + (float)h * scale_y;
+    const float ys[4] = {top, top, bottom, bottom};
+    const float us[4] = {0, u1, 0, u1};
+    const float vs[4] = {0, 0, v1, v1};
+    for (int i = 0; i < 4; i++) {
+        out.flags = i < 3 ? PVR_CMD_VERTEX : PVR_CMD_VERTEX_EOL;
+        out.x = xs[i];
+        out.y = ys[i];
+        out.u = us[i];
+        out.v = vs[i];
+        pvr_prim(&out, sizeof(out));
+    }
 }
 
 // mode < 0: vertical blanks since start-up; 1: no wait; 0: wait for the
@@ -394,6 +482,9 @@ int Psyz_VideoVSync(int mode) {
     }
     if (mode == 1) {
         return 0;
+    }
+    if (rgb24 && is_init) {
+        Present24();
     }
     EndScene();
     int count = mode > 1 ? mode : 1;
@@ -410,7 +501,7 @@ typedef struct {
 } Vtx;
 
 static inline bool CanDraw(int vertices) {
-    if (!display_enabled) {
+    if (!display_enabled || rgb24) {
         return false;
     }
     if (!is_init && !InitPlatform()) {
@@ -429,12 +520,41 @@ static inline float MapX(int x) {
     return (float)(x + draw_offset.x - fb_origin.x) * scale_x;
 }
 static inline float MapY(int y) {
-    return (float)(y + draw_offset.y - fb_origin.y) * scale_y;
+    return (float)(y + draw_offset.y - fb_origin.y + disp_top) * scale_y;
 }
 
-// n vertices in triangle-strip order
-static void SubmitStrip(const Vtx* v, int n, TexSlot* t, int mode) {
-    SendHeader(t, mode);
+static inline float FbY(int y) {
+    return (float)(y - fb_origin.y + disp_top) * scale_y;
+}
+
+// the PS1 shows nothing outside the display range: cover it
+static void MaskBorders(void) {
+    int lines = game_h > 240 ? disp_lines * 2 : disp_lines;
+    int top = game_h > 240 ? disp_top * 2 : disp_top;
+    float y0 = (float)top * scale_y;
+    float y1 = (float)(top + lines) * scale_y;
+    float bands[2][2] = {{0.0f, y0}, {y1, SCREEN_H}};
+    for (int i = 0; i < 2; i++) {
+        if (bands[i][1] - bands[i][0] < 0.5f) {
+            continue;
+        }
+        cur_hdr = -1 - BLEND_OPAQUE;
+        pvr_prim(&col_hdr[BLEND_OPAQUE], sizeof(pvr_poly_hdr_t));
+        pvr_vertex_t out = {0};
+        out.z = 1.0f;
+        out.argb = 0xFF000000;
+        const float xs[4] = {0, SCREEN_W, 0, SCREEN_W};
+        const float ys[4] = {bands[i][0], bands[i][0], bands[i][1], bands[i][1]};
+        for (int k = 0; k < 4; k++) {
+            out.flags = k < 3 ? PVR_CMD_VERTEX : PVR_CMD_VERTEX_EOL;
+            out.x = xs[k];
+            out.y = ys[k];
+            pvr_prim(&out, sizeof(out));
+        }
+    }
+}
+
+static void SubmitVertices(const Vtx* v, int n, bool white) {
     pvr_vertex_t out;
     out.z = 1.0f;
     out.oargb = 0;
@@ -444,9 +564,30 @@ static void SubmitStrip(const Vtx* v, int n, TexSlot* t, int mode) {
         out.y = v[i].y;
         out.u = v[i].u;
         out.v = v[i].v;
-        out.argb = v[i].argb;
+        out.argb = white ? 0xFFFFFFFF : v[i].argb;
         pvr_prim(&out, sizeof(out));
     }
+}
+
+// n vertices in triangle-strip order
+static void SubmitStrip(const Vtx* v, int n, TexSlot* t, int mode) {
+    if (mode != 2) {
+        SendHeader(t, mode);
+        SubmitVertices(v, n, false);
+        return;
+    }
+    // B - F has no PVR blend: invert the covered pixels (1 - B), add F
+    // (clamped at 1), invert again: B - F clamped at 0, as on the PS1
+    if (frame_vertices + 2 * n > MAX_FRAME_VERTICES) {
+        return;
+    }
+    frame_vertices += 2 * n;
+    SendHeader(NULL, BLEND_INVERT);
+    SubmitVertices(v, n, true);
+    SendHeader(t, 2);
+    SubmitVertices(v, n, false);
+    SendHeader(NULL, BLEND_INVERT);
+    SubmitVertices(v, n, true);
 }
 
 static inline uint32_t Argb(uint8_t r, uint8_t g, uint8_t b, int mode) {
@@ -496,7 +637,7 @@ static void EmitRect(int x0, int y0, int x1, int y1, int u0, int v0, int u1,
 // one framebuffer-space rectangle drawn from VRAM itself (uploads and copies
 // that land on screen), split along 16bpp texture pages
 static void EmitVramRegionQuad(int x, int y, int w, int h) {
-    if (!display_enabled || (!is_init && !InitPlatform())) {
+    if (!display_enabled || rgb24 || (!is_init && !InitPlatform())) {
         return;
     }
     int x0 = x > fb_origin.x ? x : fb_origin.x;
@@ -517,8 +658,8 @@ static void EmitVramRegionQuad(int x, int y, int w, int h) {
             uint32_t c = Argb(255, 255, 255, BLEND_OPAQUE);
             float sx0 = (float)(px - fb_origin.x) * scale_x;
             float sx1 = (float)(nx - fb_origin.x) * scale_x;
-            float sy0 = (float)(py - fb_origin.y) * scale_y;
-            float sy1 = (float)(ny - fb_origin.y) * scale_y;
+            float sy0 = FbY(py);
+            float sy1 = FbY(ny);
             float u0 = (px - page_x) / 256.0f, u1 = (nx - page_x) / 256.0f;
             float v0 = (py - page_y) / 256.0f, v1 = (ny - page_y) / 256.0f;
             Vtx v[4] = {
@@ -546,8 +687,8 @@ static void EmitFill(int x, int y, int w, int h, uint8_t r, uint8_t g,
     uint32_t c = Argb(r, g, b, BLEND_OPAQUE);
     float sx0 = (float)(x0 - fb_origin.x) * scale_x;
     float sx1 = (float)(x1 - fb_origin.x) * scale_x;
-    float sy0 = (float)(y0 - fb_origin.y) * scale_y;
-    float sy1 = (float)(y1 - fb_origin.y) * scale_y;
+    float sy0 = FbY(y0);
+    float sy1 = FbY(y1);
     Vtx v[4] = {
         {sx0, sy0, 0, 0, c},
         {sx1, sy0, 0, 0, c},
@@ -630,6 +771,11 @@ static void TryLockFbOrigin(void) {
 }
 
 void Draw_DisplayArea(unsigned int x, unsigned int y) {
+    if (disp_area.x != (int)x || disp_area.y != (int)y) {
+        frame24_dirty = true;
+    }
+    disp_area.x = (int)x;
+    disp_area.y = (int)y;
     // remember the framebuffer locations (typically two, alternating)
     for (int i = 0; i < disp_origin_count; i++) {
         if (disp_origins[i].x == (int)x && disp_origins[i].y == (int)y) {
@@ -654,14 +800,24 @@ void Draw_DisplayHorizontalRange(unsigned int start, unsigned int end) {
 }
 
 void Draw_DisplayVerticalRange(unsigned int start, unsigned int end) {
-    (void)start;
-    (void)end;
+    int top = (int)start - 16;
+    int lines = (int)end - (int)start;
+    if (lines <= 0 || lines > 256 || top < -16 || top > 64) {
+        top = 0;
+        lines = 240;
+    }
+    if (top != disp_top || lines != disp_lines) {
+        frame24_dirty = true;
+    }
+    disp_top = top;
+    disp_lines = lines;
 }
 
 void Draw_SetDisplayMode(DisplayMode* mode) {
-    if (mode->rgb24) {
-        LOG_ONCE("24-bit display mode not supported");
+    if (rgb24 != (mode->rgb24 != 0)) {
+        frame24_dirty = true;
     }
+    rgb24 = mode->rgb24 != 0;
     if (mode->horizontal_resolution_368) {
         game_w = 368;
     } else {

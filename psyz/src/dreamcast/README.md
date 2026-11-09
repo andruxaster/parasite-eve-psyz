@@ -2,8 +2,10 @@
 
 Status: **draws through the PowerVR; audio is silent.** The PsyZ core and a
 game compile and link for the SH-4 with KallistiOS. The renderer has been
-checked on the host against a software stand-in for the PVR (see
-`hosttest/`), not yet on hardware or in an emulator.
+checked on the host against a software stand-in for the PVR: a synthetic
+frame (`hosttest/`) and Parasite Eve itself from boot through its movies,
+title, name entry and opening field scenes to the opera fire, compared with
+the desktop software renderer. Not yet on hardware or in an emulator.
 
 | File | Role | State |
 | --- | --- | --- |
@@ -30,12 +32,21 @@ checked on the host against a software stand-in for the PVR (see
   in the current frame is decoded into another slot rather than overwritten,
   so earlier primitives keep their texture.
 - **Transparency.** Colour 0 is transparent. Semi-transparency modes 0
-  (B/2+F/2), 1 (B+F) and 3 (B+F/4) use PVR blending with vertex alpha;
-  mode 2 (B-F) has no PVR equivalent and is approximated as B*(1-F).
+  (B/2+F/2), 1 (B+F) and 3 (B+F/4) use PVR blending with vertex alpha.
+  Mode 2 (B-F) has no PVR blend, so the primitive is drawn three times:
+  invert the framebuffer under it, add F, invert again. That is exact,
+  clamping included (character shadows use it).
+- **24-bit display.** MDEC movies put packed RGB888 in VRAM and switch
+  the display to 24 bits. Then primitives are skipped and, at VSync, the
+  displayed rectangle is converted to one RGB565 texture and drawn whole,
+  only when VRAM changed.
+- **Display range.** The vertical display range places the picture: a
+  game showing 224 lines gets them 8 lines down, with the rest black, as
+  on a PS1.
 - **Uploads on screen.** `LoadImage`, `MoveImage` and `ClearImage` into the
   displayed framebuffer are drawn as quads, as in the PSP backend.
 - **Scale.** The PS1 framebuffer (256-640 x 240/480) is stretched to
-  640x480.
+  640x480; the horizontal display range is ignored.
 
 Not emulated yet: drawing into VRAM and sampling it back as a texture,
 reading rendered pixels back, the draw-area clip, texture windows, mask
