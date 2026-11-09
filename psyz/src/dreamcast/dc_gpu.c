@@ -308,23 +308,133 @@ static bool HitsWrapped(int x, int y, int w, int h, int bx, int by, int bw,
            Overlaps(x, y, w, h, 0, by, bx + bw - VRAM_W, bh);
 }
 
-static void InvalidateVram(int x, int y, int w, int h);
+// What one VRAM write changed: the columns of each changed row, and their
+// bounding box. Games upload the same CLUTs and textures frame after frame,
+// and only a real change needs blocks decoded again; a row of CLUTs
+// uploaded with one of them animated needs only the blocks drawn with that
+// one decoded again.
+static struct {
+    int y0, y1, x0, x1;         // bounding box (y1 < y0: nothing changed)
+    int16_t lo[VRAM_H], hi[VRAM_H]; // changed columns of rows y0..y1
+} change;
 
-// A write that changed rows first..last of a w-wide rectangle at x, y (none
-// when last < first): games upload the same CLUTs and textures frame after
-// frame, and only a real change needs blocks decoded again.
-static void InvalidateChanged(int x, int y, int w, int first, int last) {
+static inline void ChangeBegin(void) {
+    change.y0 = VRAM_H;
+    change.y1 = -1;
+    change.x0 = VRAM_W;
+    change.x1 = -1;
+}
+
+// row y changed in columns lo..hi (rows come in any order, each once)
+static inline void ChangeRow(int y, int lo, int hi) {
+    if (change.y1 < change.y0) {
+        change.y0 = change.y1 = y;
+    } else {
+        // rows between changed ones are unchanged
+        for (int r = y + 1; r < change.y0; r++) {
+            change.lo[r] = 1, change.hi[r] = 0;
+        }
+        for (int r = change.y1 + 1; r < y; r++) {
+            change.lo[r] = 1, change.hi[r] = 0;
+        }
+        change.y0 = y < change.y0 ? y : change.y0;
+        change.y1 = y > change.y1 ? y : change.y1;
+    }
+    change.lo[y] = (int16_t)lo;
+    change.hi[y] = (int16_t)hi;
+    change.x0 = lo < change.x0 ? lo : change.x0;
+    change.x1 = hi > change.x1 ? hi : change.x1;
+}
+
+// Where n halfwords at a and b, VRAM columns x.., differ (false: nowhere):
+// columns *lo..*hi, to whole runs of 16 aligned in VRAM (one 4-bit CLUT),
+// which memcmp finds quickly
+static bool RowDiff(const uint16_t* a, const uint16_t* b, int x, int n,
+                    int* lo, int* hi) {
+    if (!memcmp(a, b, (size_t)n * 2)) {
+        return false;
+    }
+    int l = 0;
+    for (;;) {
+        int end = ((x + l) | 15) + 1 - x; // the next 16-column boundary
+        end = end < n ? end : n;
+        if (memcmp(a + l, b + l, (size_t)(end - l) * 2)) {
+            break;
+        }
+        l = end;
+    }
+    int h = n;
+    for (;;) {
+        int start = ((x + h - 1) & ~15) - x;
+        start = start > l ? start : l;
+        if (memcmp(a + start, b + start, (size_t)(h - start) * 2)) {
+            break;
+        }
+        h = start;
+    }
+    *lo = x + l;
+    *hi = x + h - 1;
+    return true;
+}
+
+// Where CLUTs have been: bit b of a row is set once a block was decoded
+// with a CLUT in columns 64b..64b+63 of that row. Only there does a write
+// need its changed columns found; elsewhere (framebuffers, movie slices,
+// texels) the changed rows are enough.
+static uint16_t clut_bands[VRAM_H];
+
+static inline void NoteClut(uint32_t clut, int colors) {
+    int cx = (int)(clut & 0x3F) * 16;
+    int cy = (int)(clut >> 6) & 0x1FF;
+    int last = (cx + colors - 1) >> 6;
+    for (int b = cx >> 6; b <= last && b < 16; b++) {
+        clut_bands[cy] |= (uint16_t)(1u << b);
+    }
+}
+
+// the bands a w-wide write at x covers
+static inline uint16_t BandMask(int x, int w) {
+    int b0 = x >> 6, b1 = (x + w - 1) >> 6;
+    return (uint16_t)(((2u << b1) - 1) & ~((1u << b0) - 1));
+}
+
+// a changed row of a write: its changed columns where CLUTs have been,
+// the whole width elsewhere
+static inline bool WriteRow(int y, uint16_t bands, uint16_t* dst,
+                            const uint16_t* src, int x, int w) {
+    int lo, hi;
+    if (clut_bands[y] & bands) {
+        if (!RowDiff(dst, src, x, w, &lo, &hi)) {
+            return false;
+        }
+    } else {
+        if (!memcmp(dst, src, (size_t)w * 2)) {
+            return false;
+        }
+        lo = x;
+        hi = x + w - 1;
+    }
+    ChangeRow(y, lo, hi);
+    return true;
+}
+
+static void InvalidateChange(void);
+
+static void ChangeEnd(void) {
     stats.writes++;
-    if (last < first)
+    if (change.y1 < change.y0)
         return;
     stats.changed++;
-    InvalidateVram(x, y + first, w, last - first + 1);
+    InvalidateChange();
 }
 
 // bumped by every change to the VRAM copy
 static uint32_t vram_epoch;
 
-static void InvalidateVram(int x, int y, int w, int h) {
+// marks the blocks the change reaches for decoding again
+static void InvalidateChange(void) {
+    int x = change.x0, y = change.y0;
+    int w = change.x1 - change.x0 + 1, h = change.y1 - change.y0 + 1;
     vram_epoch++;
     memo_slot = NULL;
     frame24_dirty = true;
@@ -338,7 +448,9 @@ static void InvalidateVram(int x, int y, int w, int h) {
             uint32_t clut = KeyClut(s->key);
             int cx = (int)(clut & 0x3F) * 16;
             int cy = (int)(clut >> 6) & 0x1FF;
-            if (Overlaps(x, y, w, h, cx, cy, bpp ? 256 : 16, 1)) {
+            // the CLUT's own row: did this write change any of its colours?
+            if (cy >= change.y0 && cy <= change.y1 &&
+                cx <= change.hi[cy] && cx + (bpp ? 256 : 16) > change.lo[cy]) {
                 s->dirty = true;
                 s->dirty_why = DIRTY_CLUT;
                 continue;
@@ -522,6 +634,9 @@ static TexSlot* UseSlot(TexSlot* s, uint64_t key, const Block* b) {
         s->wrap_v = (uint8_t)(b->wv ? (1 << b->wv) - 1 : 255);
         s->hdr_mode = HDR_NONE;
         HashInsert(s);
+        if (((key >> 5) & 3) < 2) {
+            NoteClut(KeyClut(key), (key >> 5) & 1 ? 256 : 16);
+        }
     }
     bool beyond = req_u0 < s->used_u0 || req_v0 < s->used_v0 ||
                   req_u1 > s->used_u1 || req_v1 > s->used_v1;
@@ -1836,18 +1951,25 @@ void Draw_ClearImage(RECT* rect, u_char r, u_char g, u_char b) {
             return;
         }
     }
-    int first = h, last = -1;
+    ChangeBegin();
     for (int row = 0; row < h; ++row) {
         uint16_t* dst = &vram[(y + row) * VRAM_W + x];
-        for (int col = 0; col < w; ++col) {
-            if (dst[col] != c) {
-                first = row < first ? row : first;
-                last = row;
-                dst[col] = c;
-            }
+        int lo = 0, hi = w - 1;
+        while (lo < w && dst[lo] == c) {
+            lo++;
         }
+        if (lo == w) {
+            continue; // already that colour
+        }
+        while (dst[hi] == c) {
+            hi--;
+        }
+        for (int col = lo; col <= hi; ++col) {
+            dst[col] = c;
+        }
+        ChangeRow(y + row, x + lo, x + hi);
     }
-    InvalidateChanged(x, y, w, first, last);
+    ChangeEnd();
     // a change made clears remembered before it stale; this one stands
     clears[next_clear].x = x;
     clears[next_clear].y = y;
@@ -1874,16 +1996,15 @@ void Draw_LoadImage(RECT* rect, u_long* p) {
     }
 #endif
     const uint16_t* src = (const uint16_t*)p;
-    int first = h, last = -1;
+    ChangeBegin();
+    uint16_t bands = BandMask(x, w);
     for (int row = 0; row < h; ++row) {
         uint16_t* dst = &vram[(y + row) * VRAM_W + x];
-        if (memcmp(dst, src + row * rect->w, w * 2)) {
-            first = row < first ? row : first;
-            last = row;
+        if (WriteRow(y + row, bands, dst, src + row * rect->w, x, w)) {
             memcpy(dst, src + row * rect->w, w * 2);
         }
     }
-    InvalidateChanged(x, y, w, first, last);
+    ChangeEnd();
     EmitVramRegionQuad(x, y, w, h);
 }
 
@@ -1911,18 +2032,17 @@ void Draw_MoveImage(RECT* rect, unsigned int x, unsigned int y) {
     if (y + h > VRAM_H) {
         h = VRAM_H - y;
     }
-    int first = h, last = -1;
+    ChangeBegin();
+    uint16_t bands = BandMask((int)x, w);
     for (int row = 0; row < h; ++row) {
         int r = y > (unsigned)sy ? h - 1 - row : row;
         uint16_t* dst = &vram[(y + r) * VRAM_W + x];
         const uint16_t* from = &vram[(sy + r) * VRAM_W + sx];
-        if (memcmp(dst, from, w * 2)) {
-            first = r < first ? r : first;
-            last = r > last ? r : last;
+        if (WriteRow((int)y + r, bands, dst, from, (int)x, w)) {
             memmove(dst, from, w * 2);
         }
     }
-    InvalidateChanged((int)x, (int)y, w, first, last);
+    ChangeEnd();
     EmitVramRegionQuad((int)x, (int)y, w, h);
 }
 

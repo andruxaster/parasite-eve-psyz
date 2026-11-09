@@ -26,7 +26,10 @@ the desktop software renderer. Not yet on hardware or in an emulator.
   disabled, so the PVR keeps the submission order. A scene opens at the
   first primitive and is shown at the game's next `VSync`.
 - **VRAM.** A 1 MB CPU copy of the PS1 VRAM takes uploads, fills and copies,
-  and answers `StoreImage`.
+  and answers `StoreImage`. A write that changes nothing costs one compare
+  per row. Where CLUTs have been, the changed columns are found (to runs of
+  16), so a row of CLUTs uploaded with one of them animated sends only the
+  blocks drawn with that one to be decoded again.
 - **Textures.** A primitive's texels (4, 8 or 16 bpp, plus its CLUT) are
   decoded from that copy into an ARGB1555 block in PVR memory: the
   smallest power-of-two rectangle (16 to 256 a side, starting on a
