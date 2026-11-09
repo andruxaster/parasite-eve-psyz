@@ -181,12 +181,24 @@ int Psyz_GpuSetHorizontalGrid(
     return Draw_SetHorizontalGrid(source_width, target_width);
 }
 
+// a primitive, the usual packet: drawn, and its length returned
+static inline int DispatchPrim(u_long* buf, int len) {
+    if (vram_copy && !vram_area_marked) {
+        VramCopyDrawn();
+    }
+    return Draw_PushPrim(buf, len);
+}
+
 static void DispatchPackets(u_long* buf, int len) {
     RECT rect;
     unsigned int x, y;
     for (int i = 0; i < len; i++) {
         u_long op = buf[i];
         int code = (int)(buf[i] >> 24) & 0xFF;
+        if ((unsigned)(code - 0x20) < 0x60u) { // polygon, line or rectangle
+            i += DispatchPrim(&buf[i], len - i) - 1;
+            continue;
+        }
         // https://psx-spx.consoledev.net/graphicsprocessingunitgpu/#gpu-render-polygon-commands
         switch (code) {
         case 0x00:
@@ -252,11 +264,6 @@ static void DispatchPackets(u_long* buf, int len) {
             Draw_SetMask(!!(op & 1), !!(op & 2));
             break;
         default:
-            if (code >= 0x20 && code < 0x80) {
-                VramCopyDrawn();
-                i += Draw_PushPrim(&buf[i], len - i) - 1;
-                break;
-            }
             if (user_gpu_commands[code].handler) {
                 int consumed = user_gpu_commands[code].handler(
                     &buf[i], len - i, user_gpu_commands[code].userdata);
@@ -316,8 +323,18 @@ static void GPU_Enqueue(u_long* packets) {
     if (sizeof(u_long) == 4) {
         // fast path for 32-bit systems
         while (1) {
-            if (env->len > 0) {
-                DispatchPackets((u_long*)env->code, (int)env->len);
+            int len = (int)env->len;
+            if (len > 0) {
+                u_long* code = (u_long*)env->code;
+                unsigned op = (unsigned)(code[0] >> 24) & 0xFF;
+                int done = 0;
+                // most entries hold one primitive
+                if (op - 0x20u < 0x60u) {
+                    done = DispatchPrim(code, len);
+                }
+                if (done < len) {
+                    DispatchPackets(code + done, len - done);
+                }
             }
             if (isendprim(env)) {
                 break;
