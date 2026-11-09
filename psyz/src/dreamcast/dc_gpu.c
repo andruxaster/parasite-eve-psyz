@@ -39,6 +39,7 @@
 #include <kos/thread.h>
 #include <kos/timer.h>
 #include "../draw.h"
+#include "dc_prof.h"
 #ifdef PSYZ_GTE_SUBPIXEL
 #include <psyz/subpixel.h>
 #endif
@@ -118,6 +119,7 @@ static const int class_max[TEX_CLASSES] = {800, 256, 128, 40, 16, 8};
 #define RETIRED_KEY (UINT64_C(3) << 5) // bpp 3: TexKey never builds it
 
 typedef struct TexSlot {
+    pvr_poly_hdr_t hdr; // compiled for hdr_mode (HDR_NONE: not yet)
     pvr_ptr_t ptr;
     struct TexSlot* next; // hash chain
     uint64_t key;
@@ -131,11 +133,14 @@ typedef struct TexSlot {
     // reaches past the used box
     int16_t used_u0, used_v0, used_u1, used_v1;
     uint8_t cls;
+    uint8_t hdr_mode; // blend mode * 2 + filter of hdr
     uint8_t dirty_why; // DIRTY_*: why it is decoded next (statistics)
     bool valid;
     bool dirty;
     bool stale_outside;
 } TexSlot;
+
+#define HDR_NONE 0xFF
 
 // why a slot is decoded
 enum { DIRTY_NEW, DIRTY_CLUT, DIRTY_TEXELS, DIRTY_OUTSIDE, DIRTY_REASONS };
@@ -484,6 +489,7 @@ static TexSlot* UseSlot(TexSlot* s, uint64_t key, const Block* b) {
         s->v0 = (uint16_t)b->v0;
         s->w = (uint16_t)b->w;
         s->h = (uint16_t)b->h;
+        s->hdr_mode = HDR_NONE;
         HashInsert(s);
     }
     bool beyond = req_u0 < s->used_u0 || req_v0 < s->used_v0 ||
@@ -732,10 +738,14 @@ static void SendHeader(TexSlot* t, int mode, bool filter) {
         pvr_prim(&col_hdr[mode], sizeof(pvr_poly_hdr_t));
         return;
     }
-    pvr_poly_hdr_t hdr;
-    CompileHeaderFmt(&hdr, t->ptr, PVR_TXRFMT_ARGB1555, t->w, t->h, mode,
-                     t->w < 256 || t->h < 256, filter);
-    pvr_prim(&hdr, sizeof(hdr));
+    // compiling a header costs more than sending it: keep the slot's last
+    int hdr_mode = mode * 2 + filter;
+    if (t->hdr_mode != hdr_mode) {
+        CompileHeaderFmt(&t->hdr, t->ptr, PVR_TXRFMT_ARGB1555, t->w, t->h,
+                         mode, t->w < 256 || t->h < 256, filter);
+        t->hdr_mode = (uint8_t)hdr_mode;
+    }
+    pvr_prim(&t->hdr, sizeof(t->hdr));
 }
 
 // texture coordinate of texel `t` inside the slot's block
@@ -804,6 +814,7 @@ static bool InitPlatform(void) {
           class_count[4], class_count[5],
           (unsigned)(pvr_mem_available() / 1024));
     stats.start_us = timer_us_gettime64();
+    DcProf_Start();
     is_init = true;
     return true;
 }
@@ -858,6 +869,7 @@ static void EndScene(void) {
               stats.class_decodes[4], stats.class_decodes[5], stats.why[0],
               stats.why[1], stats.why[2], stats.why[3], stats.writes,
               stats.changed);
+        DcProf_Report();
         memset(&stats, 0, sizeof(stats));
         stats.start_us = now;
     }
