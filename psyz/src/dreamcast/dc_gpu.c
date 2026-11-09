@@ -108,8 +108,9 @@ static const uint8_t blend_alpha[BLEND_MODES] = {128, 255, 255, 64, 255, 255};
 #define RAW_TEXTURE 1 // variant: every texel opaque (VRAM region blits)
 static const int class_texels[TEX_CLASSES] = {1024, 4096, 16384, 32768,
                                               65536};
-static const int class_max[TEX_CLASSES] = {256, 128, 48, 16, 8};
-#define TEX_SLOTS_MAX (256 + 128 + 48 + 16 + 8)
+// Small blocks are the most numerous: models use many CLUTs and parts.
+static const int class_max[TEX_CLASSES] = {512, 128, 40, 16, 8};
+#define TEX_SLOTS_MAX (512 + 128 + 40 + 16 + 8)
 #define TEX_HASH 1024
 #define RETIRED_KEY (UINT64_C(3) << 5) // bpp 3: TexKey never builds it
 
@@ -167,6 +168,7 @@ static PageStat page_stats[PAGE_STATS];
 #define STATS_FRAMES 300
 static struct {
     uint32_t decodes, decoded_texels, overwrites, vertices, frames;
+    uint32_t class_decodes[TEX_CLASSES];
     uint32_t polys, subpixel_polys; // polygons; those placed between pixels
     uint64_t decode_us, start_us;
     uint64_t pvr_wait_us; // pvr_wait_ready: the PVR still drawing
@@ -380,6 +382,7 @@ static void DecodeSlot(TexSlot* s) {
     }
 #endif
     stats.decodes++;
+    stats.class_decodes[s->cls]++;
     stats.decoded_texels += (uint32_t)(w * h);
     stats.decode_us += timer_us_gettime64() - t0;
 }
@@ -742,7 +745,7 @@ static bool InitPlatform(void) {
     pvr_set_bg_color(0.0f, 0.0f, 0.0f);
     frame24 = pvr_mem_malloc(FRAME24_W * FRAME24_H * 2);
     // fill the classes from the largest down while PVR memory lasts
-    size_t reserve = 192 * 1024;
+    size_t reserve = 64 * 1024;
     int next = 0;
     for (int c = TEX_CLASSES - 1; c >= 0; c--) {
         size_t bytes = (size_t)class_texels[c] * 2;
@@ -812,7 +815,7 @@ static void EndScene(void) {
         INFOF("gpu: %u frames in %u ms (%u.%u fps), %u verts/frame, "
               "%u decodes (%u Ktexels, %u ms), %u in-frame overwrites; "
               "waiting for PVR %u ms, idle in vblank %u ms, movie upload "
-              "%u ms; %u%% of polygons subpixel",
+              "%u ms; decodes by pool 1K/4K/16K/32K/64K %u/%u/%u/%u/%u",
               stats.frames, ms, ms ? stats.frames * 1000u / ms : 0,
               ms ? stats.frames * 10000u / ms % 10 : 0,
               stats.vertices / stats.frames, stats.decodes,
@@ -821,7 +824,9 @@ static void EndScene(void) {
               (uint32_t)(stats.pvr_wait_us / 1000u),
               (uint32_t)(stats.vblank_us / 1000u),
               (uint32_t)(stats.movie_us / 1000u),
-              stats.polys ? stats.subpixel_polys * 100u / stats.polys : 0);
+              stats.class_decodes[0], stats.class_decodes[1],
+              stats.class_decodes[2], stats.class_decodes[3],
+              stats.class_decodes[4]);
         memset(&stats, 0, sizeof(stats));
         stats.start_us = now;
     }
