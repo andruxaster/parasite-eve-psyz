@@ -44,8 +44,8 @@ the desktop software renderer. Not yet on hardware or in an emulator.
   are filtered bilinearly; sprites and text stay sharp. A transparent texel
   takes an opaque neighbour's colour when decoded, so filtering leaves no
   dark fringe around cut-outs.
-- **Subpixel vertices and perspective.** With `PSYZ_GTE_SUBPIXEL` (set in
-  the Dreamcast build) the GTE keeps the 8 fractional bits of each projected
+- **Subpixel vertices and perspective** (off in the game's Dreamcast build
+  for now). With `PSYZ_GTE_SUBPIXEL` the GTE keeps the 8 fractional bits of each projected
   X/Y it would drop, and SZ, by the address the game stores the vertex to
   (`gte_stsxy`, and the copies `Psyz_GteCopyPgxpSxy` reports) and by screen
   position (`include/psyz/subpixel.h`). A polygon whose vertices are all
