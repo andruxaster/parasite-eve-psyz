@@ -304,7 +304,11 @@ static void InvalidateChanged(int x, int y, int w, int first, int last) {
     InvalidateVram(x, y + first, w, last - first + 1);
 }
 
+// bumped by every change to the VRAM copy
+static uint32_t vram_epoch;
+
 static void InvalidateVram(int x, int y, int w, int h) {
+    vram_epoch++;
     memo_slot = NULL;
     frame24_dirty = true;
     for (int i = 0; i < tex_slot_count; i++) {
@@ -1043,18 +1047,20 @@ static void MaskBorders(void) {
     }
 }
 
+// Vertices are written straight into a store queue that the open list
+// points at the TA (direct rendering), with no copy in between.
 static void SubmitVertices(const Vtx* v, int n, bool white) {
-    pvr_vertex_t out;
-    out.oargb = 0;
     for (int i = 0; i < n; i++) {
-        out.flags = i + 1 < n ? PVR_CMD_VERTEX : PVR_CMD_VERTEX_EOL;
-        out.z = v[i].z > 0.0f ? v[i].z : 1.0f;
-        out.x = v[i].x;
-        out.y = v[i].y;
-        out.u = v[i].u;
-        out.v = v[i].v;
-        out.argb = white ? 0xFFFFFFFF : v[i].argb;
-        pvr_prim(&out, sizeof(out));
+        pvr_vertex_t* out = pvr_dr_target();
+        out->flags = i + 1 < n ? PVR_CMD_VERTEX : PVR_CMD_VERTEX_EOL;
+        out->x = v[i].x;
+        out->y = v[i].y;
+        out->z = v[i].z > 0.0f ? v[i].z : 1.0f;
+        out->u = v[i].u;
+        out->v = v[i].v;
+        out->argb = white ? 0xFFFFFFFF : v[i].argb;
+        out->oargb = 0;
+        pvr_dr_commit(out);
     }
 }
 
@@ -1224,6 +1230,7 @@ void Draw_Reset(void) {
         return;
     }
     memset(vram, 0, sizeof(vram));
+    vram_epoch++;
     for (int i = 0; i < tex_slot_count; i++) {
         tex_slots[i].valid = false;
         tex_slots[i].next = NULL;
@@ -1392,6 +1399,21 @@ void Draw_ClearImage(RECT* rect, u_char r, u_char g, u_char b) {
         return;
     }
     uint16_t c = (uint16_t)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
+    // games clear the same area every frame; with no VRAM change since the
+    // last such clear, it already holds the colour
+    static struct {
+        int x, y, w, h;
+        uint16_t c;
+        uint32_t epoch;
+        bool valid;
+    } last_clear;
+    if (last_clear.valid && last_clear.epoch == vram_epoch &&
+        last_clear.x == x && last_clear.y == y && last_clear.w == w &&
+        last_clear.h == h && last_clear.c == c) {
+        stats.writes++;
+        EmitFill(x, y, w, h, r, g, b);
+        return;
+    }
     int first = h, last = -1;
     for (int row = 0; row < h; ++row) {
         uint16_t* dst = &vram[(y + row) * VRAM_W + x];
@@ -1404,6 +1426,13 @@ void Draw_ClearImage(RECT* rect, u_char r, u_char g, u_char b) {
         }
     }
     InvalidateChanged(x, y, w, first, last);
+    last_clear.x = x;
+    last_clear.y = y;
+    last_clear.w = w;
+    last_clear.h = h;
+    last_clear.c = c;
+    last_clear.epoch = vram_epoch;
+    last_clear.valid = true;
     EmitFill(x, y, w, h, r, g, b);
 }
 

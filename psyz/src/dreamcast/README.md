@@ -125,6 +125,13 @@ bits, dithering, per-texel STP on semi-transparent primitives (the whole
 primitive blends), and textured colours above 0x80 (the PVR modulates up to
 1.0, the PS1 up to 2.0).
 
+## Profiler
+
+`dc_prof.c` samples the program counter 1000 times a second on TMU1 and
+logs the busiest 128-byte code buckets with the GPU statistics (`prof:`
+lines; inside `memcpy`, `memset` and `memmove` it counts the caller too,
+`prof callers:`). `sh-elf-nm -n` on the ELF of the same build names them.
+
 ## Memory cards
 
 `dc_card.c` puts the PS1 memory cards on VMUs: card 1 (`bu00:`) is the VMU
