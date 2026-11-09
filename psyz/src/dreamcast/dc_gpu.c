@@ -36,6 +36,7 @@
 #include <dc/pvr.h>
 #include <dc/vblank.h>
 #include <dc/video.h>
+#include <dc/biosfont.h>
 #include <kos/thread.h>
 #include <kos/timer.h>
 #include "../draw.h"
@@ -1039,6 +1040,55 @@ static void Present24(void) {
         out.v = vs[i];
         pvr_prim(&out, sizeof(out));
     }
+}
+
+// A few centred lines of the BIOS font on black, shown alone for one frame
+// (the platform's own screens, such as the disc change prompt). The text
+// goes into the 24-bit display texture, which no movie is using then.
+void DcGpu_ShowMessage(const char* const* lines, int count) {
+    if (!is_init && !InitPlatform()) {
+        return;
+    }
+    if (!frame24) {
+        return;
+    }
+    EndScene();
+    BeginScene(); // waits for the previous render, which may read frame24
+    int max_lines = FRAME24_H / BFONT_HEIGHT;
+    count = count > max_lines ? max_lines : count;
+    static uint16_t text[FRAME24_W * BFONT_HEIGHT] __attribute__((aligned(32)));
+    for (int i = 0; i < count; i++) {
+        memset(text, 0, sizeof(text));
+        int x = (FRAME24_W - (int)strlen(lines[i]) * BFONT_THIN_WIDTH) / 2;
+        bfont_draw_str_ex(text + (x > 0 ? x : 0), FRAME24_W, 0xFFFF, 0, 16,
+                          true, lines[i]);
+        pvr_txr_load(text, (uint16_t*)frame24 + i * BFONT_HEIGHT * FRAME24_W,
+                     sizeof(text));
+    }
+    frame24_dirty = true; // a movie picture must be converted again
+    pvr_poly_hdr_t hdr;
+    CompileHeaderFmt(&hdr, frame24, PVR_TXRFMT_RGB565, FRAME24_W, FRAME24_H,
+                     BLEND_OPAQUE, false, false);
+    cur_hdr = -100;
+    pvr_prim(&hdr, sizeof(hdr));
+    float h = (float)(count * BFONT_HEIGHT);
+    float x0 = (SCREEN_W - FRAME24_W) / 2.0f, y0 = (SCREEN_H - h) / 2.0f;
+    const float xs[4] = {x0, x0 + FRAME24_W, x0, x0 + FRAME24_W};
+    const float ys[4] = {y0, y0, y0 + h, y0 + h};
+    const float vs[4] = {0, 0, h / FRAME24_H, h / FRAME24_H};
+    pvr_vertex_t out = {0};
+    out.z = 1.0f;
+    out.argb = 0xFFFFFFFF;
+    for (int i = 0; i < 4; i++) {
+        out.flags = i < 3 ? PVR_CMD_VERTEX : PVR_CMD_VERTEX_EOL;
+        out.x = xs[i];
+        out.y = ys[i];
+        out.u = i & 1 ? 1.0f : 0.0f;
+        out.v = vs[i];
+        pvr_prim(&out, sizeof(out));
+    }
+    frame_vertices += 4;
+    EndScene();
 }
 
 static void VblankIrq(uint32_t code, void* data) {
