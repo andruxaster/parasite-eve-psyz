@@ -39,19 +39,34 @@ static int sign_bits(unsigned value, unsigned bits) {
 static u16 read16(const u8* p) { return p[0] | (u16)p[1] << 8; }
 static u32 read32(const u8* p) { return read16(p) | (u32)read16(p + 2) << 16; }
 
+// Two passes of an 8x8 matrix product, as the MDEC does. 32-bit sums are
+// exact: coefficients are clamped to 11 bits and dct >> 3 is within 13, so
+// pass 1 sums stay under 2^26 and pass 2 (inputs under 2^13) under 2^28.
+// Zero coefficients, the vast majority in movie data, are skipped.
 static void inverse_dct(int block[64]) {
     int work[64];
     int dct[64];
     for (unsigned i = 0; i < 64; ++i)
         dct[i] = floor_shift(mdec.env.dct[i], 3);
     for (unsigned pass = 0; pass < 2; ++pass) {
-        for (unsigned y = 0; y < 8; ++y)
-            for (unsigned x = 0; x < 8; ++x) {
-                int64_t sum = 0;
-                for (unsigned z = 0; z < 8; ++z)
-                    sum += (int64_t)block[y + z * 8] * dct[x + z * 8];
-                work[x + y * 8] = floor_shift(sum + 0xfff, 13);
+        for (unsigned y = 0; y < 8; ++y) {
+            unsigned nz[8], count = 0;
+            for (unsigned z = 0; z < 8; ++z)
+                if (block[y + z * 8])
+                    nz[count++] = z;
+            if (!count) {
+                // (0 + 0xfff) >> 13
+                for (unsigned x = 0; x < 8; ++x)
+                    work[x + y * 8] = 0;
+                continue;
             }
+            for (unsigned x = 0; x < 8; ++x) {
+                int32_t sum = 0;
+                for (unsigned k = 0; k < count; ++k)
+                    sum += block[y + nz[k] * 8] * dct[x + nz[k] * 8];
+                work[x + y * 8] = (sum + 0xfff) >> 13;
+            }
+        }
         memcpy(block, work, sizeof(work));
     }
     for (unsigned i = 0; i < 64; ++i)
@@ -154,41 +169,43 @@ static void decode(const u8* source, const u8* end) {
                     out[i / 2] |= (u8)(v & 0xf0);
             }
         } else {
-            for (unsigned y = 0; y < 16; ++y)
-                for (unsigned x = 0; x < 16; ++x) {
-                    unsigned chroma = x / 2 + y / 2 * 8;
-                    int cr = blocks[0][chroma], cb = blocks[1][chroma];
-                    int luminance =
-                        blocks[2 + x / 8 + y / 8 * 2][x % 8 + y % 8 * 8];
-                    int color[3] = {
-                        luminance + floor_shift(359 * cr + 128, 8),
-                        luminance + floor_shift(-88 * cb - 183 * cr + 128, 8),
-                        luminance + floor_shift(454 * cb + 128, 8)};
-                    unsigned rgb[3];
-                    for (unsigned c = 0; c < 3; ++c) {
-                        rgb[c] = (u8)clamp(color[c], -128, 127);
-                        if (!(mdec.command & (1u << 26)))
-                            rgb[c] ^= 128;
-                    }
-                    unsigned pixel = x + y * 16;
-                    if (depth == 2) {
-                        for (unsigned c = 0; c < 3; ++c)
-                            out[pixel * 3 + c] = (u8)rgb[c];
-                    } else {
-                        unsigned five[3];
-                        for (unsigned c = 0; c < 3; ++c) {
-                            unsigned value =
-                                (u8)clamp(color[c], -128, 127) ^ 128;
-                            five[c] = clamp((value + 4) >> 3, 0, 31);
-                            if (mdec.command & (1u << 26))
-                                five[c] ^= 16;
+            // the chroma terms are shared by each 2x2 group of pixels
+            unsigned flip = (mdec.command & (1u << 26)) ? 0 : 128;
+            unsigned stp = (mdec.command >> 10) & 0x8000;
+            unsigned five_flip = (mdec.command & (1u << 26)) ? 16 : 0;
+            for (unsigned cy = 0; cy < 8; ++cy)
+                for (unsigned cx = 0; cx < 8; ++cx) {
+                    int cr = blocks[0][cx + cy * 8], cb = blocks[1][cx + cy * 8];
+                    int offset[3] = {floor_shift(359 * cr + 128, 8),
+                                     floor_shift(-88 * cb - 183 * cr + 128, 8),
+                                     floor_shift(454 * cb + 128, 8)};
+                    for (unsigned dy = 0; dy < 2; ++dy)
+                        for (unsigned dx = 0; dx < 2; ++dx) {
+                            unsigned x = cx * 2 + dx, y = cy * 2 + dy;
+                            int luminance =
+                                blocks[2 + x / 8 + y / 8 * 2][x % 8 + y % 8 * 8];
+                            unsigned pixel = x + y * 16;
+                            if (depth == 2) {
+                                for (unsigned c = 0; c < 3; ++c)
+                                    out[pixel * 3 + c] = (u8)(
+                                        (u8)clamp(luminance + offset[c], -128, 127) ^
+                                        flip);
+                            } else {
+                                unsigned five[3];
+                                for (unsigned c = 0; c < 3; ++c) {
+                                    unsigned value =
+                                        (u8)clamp(luminance + offset[c], -128, 127) ^
+                                        128;
+                                    five[c] =
+                                        (unsigned)clamp((int)(value + 4) >> 3, 0, 31) ^
+                                        five_flip;
+                                }
+                                u16 packed = (u16)(five[0] | five[1] << 5 |
+                                                   five[2] << 10 | stp);
+                                out[pixel * 2] = (u8)packed;
+                                out[pixel * 2 + 1] = (u8)(packed >> 8);
+                            }
                         }
-                        u16 packed =
-                            (u16)(five[0] | five[1] << 5 | five[2] << 10 |
-                                  ((mdec.command >> 10) & 0x8000));
-                        out[pixel * 2] = (u8)packed;
-                        out[pixel * 2 + 1] = (u8)(packed >> 8);
-                    }
                 }
         }
         mdec.length += bytes;
