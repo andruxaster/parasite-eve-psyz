@@ -1,5 +1,6 @@
 #include <psyz/gpu.h>
 #include <psyz.h>
+#include <stdint.h>
 #ifdef PE_PS5_GPU_NATIVE
 #include <psyz/video.h>
 #endif
@@ -324,6 +325,15 @@ static void GPU_Enqueue(u_long* packets) {
         // fast path for 32-bit systems
         while (1) {
             int len = (int)env->len;
+#ifdef __GNUC__
+            // the walk is a chain of loads: ask for the next entry (often a
+            // primitive elsewhere) and for the table ahead (it runs down
+            // through memory) while this one is drawn
+            if (!isendprim(env)) {
+                __builtin_prefetch(nextPrim(env));
+            }
+            __builtin_prefetch((const char*)env - 64);
+#endif
             if (len > 0) {
                 u_long* code = (u_long*)env->code;
                 unsigned op = (unsigned)(code[0] >> 24) & 0xFF;
@@ -513,10 +523,39 @@ static int psyz_otc(OT_TYPE* ot, s32 n) {
     if (n <= 0) {
         return 0;
     }
+#if defined(__sh__) && defined(__psyz) &&                                      \
+    (defined(__SH4__) || defined(__SH4_SINGLE__) || defined(__SH4_SINGLE_ONLY__))
+    // The SH-4's 16 KB operand cache reads a 32-byte line from memory before
+    // a store into it can go in. The table (4096 entries of 8 bytes in Parasite
+    // Eve) is written whole, so movca.l takes each whole line without reading
+    // it, and the other seven words follow at once.
+    for (i = n - 1; i > 0;) {
+        OT_TYPE* e = &ot[i];
+        if (i >= 4 && ((uintptr_t)e & 31) == 32 - sizeof(OT_TYPE)) {
+            OT_TYPE* l = e - 3; // a line of entries i-3..i, none of them ot[0]
+            register u_long first __asm__("r0") = (u_long)(l - 1);
+            __asm__ volatile("movca.l r0, @%0" : : "r"(l), "z"(first)
+                             : "memory");
+            l[0].len = 0;
+            l[1].tag = (u_long)&l[0];
+            l[1].len = 0;
+            l[2].tag = (u_long)&l[1];
+            l[2].len = 0;
+            l[3].tag = (u_long)&l[2];
+            l[3].len = 0;
+            i -= 4;
+            continue;
+        }
+        setaddr(e, e - 1);
+        setlen(e, 0);
+        i--;
+    }
+#else
     for (i = n - 1; i > 0; i--) {
         setaddr(&ot[i], &ot[i - 1]);
         setlen(&ot[i], 0);
     }
+#endif
     setaddr(&ot[0], 0xFFFFFF);
     setlen(&ot[0], 0);
     return 0;

@@ -124,6 +124,7 @@ typedef struct TexSlot {
     pvr_ptr_t ptr;
     struct TexSlot* next; // hash chain
     uint64_t key;
+    uint32_t tex_id; // TexId(key): which texture, for FindTexture
     uint32_t last_used;
     uint32_t used_frame;
     uint16_t u0, v0; // block origin in the page, texels
@@ -238,6 +239,14 @@ static inline uint64_t TexKey(u16 tpage, u16 clut, int variant,
     key |= bpp < 2 ? (uint64_t)(clut & 0x7FFF) << 21 : (uint64_t)variant << 21;
     key |= (uint64_t)b->wu << 36 | (uint64_t)b->wv << 39;
     return key;
+}
+
+// The key bits that say which texture a block holds (page and depth, CLUT
+// or variant, texture window), packed in 32 bits: blocks of one texture
+// differ only in the rest (block size and place)
+static inline uint32_t TexId(uint64_t key) {
+    return (uint32_t)(key & 0x7F) | (uint32_t)((key >> 21) & 0x7FFF) << 7 |
+           (uint32_t)((key >> 36) & 0x3F) << 22;
 }
 
 static inline uint32_t KeyClut(uint64_t key) {
@@ -603,6 +612,7 @@ static TexSlot* LookupSlot(uint64_t key) {
         // valid, so PickVictim keeps it until the frame is rendered.
         HashRemove(s);
         s->key = RETIRED_KEY;
+        s->tex_id = TexId(RETIRED_KEY);
         s->dirty = false;
         s = NULL;
     }
@@ -624,6 +634,7 @@ static TexSlot* UseSlot(TexSlot* s, uint64_t key, const Block* b) {
         s->dirty = true;
         s->dirty_why = DIRTY_NEW;
         s->key = key;
+        s->tex_id = TexId(key);
         s->u0 = (uint16_t)b->u0;
         s->v0 = (uint16_t)b->v0;
         s->w = (uint16_t)b->w;
@@ -808,75 +819,68 @@ static TexSlot* FindTextureSlow(u16 tpage, u16 clut, int variant, int umin,
 // Primitives mostly reuse a texture: a model's material, a background's
 // tiles (often many of one page and CLUT), frame after frame.
 #define FIND_CACHE 1024
-static struct {
-    TexSlot* slot;
-    uint64_t key;
-    u16 tpage, clut;
-    uint16_t cell;
-    uint8_t variant;
-} find_cache[FIND_CACHE];
+// slot index + 1 (0: none): 2 KB, which stays in the SH-4's 16 KB cache
+static uint16_t find_cache[FIND_CACHE];
 
 // the block found last: primitives come in runs of one texture (a model's
 // material, a background's tiles), so most find it again without hashing
-static struct {
-    TexSlot* slot;
-    uint64_t key;
-    u16 tpage, clut;
-    uint8_t variant;
-} find_last;
+static TexSlot* find_last;
+
+// TexId of the blocks that hold a request's texture (no texture window)
+static inline uint32_t RequestId(u16 tpage, u16 clut, int variant) {
+    uint32_t bpp = (tpage >> 7) & 3;
+    if (bpp > 2) {
+        bpp = 2;
+    }
+    return (uint32_t)(tpage & 0x1F) | bpp << 5 |
+           (bpp < 2 ? (uint32_t)(clut & 0x7FFF) : (uint32_t)variant) << 7;
+}
+
+// Whether block s answers a request for texels umin..umax, vmin..vmax of
+// that texture: it holds them, decoded and drawn from since. Then it is the
+// block the full search would find for them.
+static inline bool Serves(const TexSlot* s, uint32_t want, int umin, int vmin,
+                          int umax, int vmax) {
+    return s->tex_id == want && s->valid && !s->dirty &&
+           umin >= s->used_u0 && vmin >= s->used_v0 && umax <= s->used_u1 &&
+           vmax <= s->used_v1;
+}
+
+static inline TexSlot* Found(TexSlot* s, int umin, int vmin, int umax,
+                             int vmax) {
+    req_u0 = umin;
+    req_v0 = vmin;
+    req_u1 = umax;
+    req_v1 = vmax;
+    if (s->used_frame != frame_no) { // drawn this frame: keep it
+        s->used_frame = frame_no;
+        s->last_used = ++tex_clock;
+    }
+    find_last = s;
+    return s;
+}
 
 static TexSlot* FindTexture(u16 tpage, u16 clut, int variant, int umin,
                             int vmin, int umax, int vmax) {
-    TexSlot* s = find_last.slot;
-    if (s && find_last.tpage == tpage && find_last.clut == clut &&
-        find_last.variant == variant && s->key == find_last.key && s->valid &&
-        !s->dirty && !(tex_window.log2_u | tex_window.log2_v) &&
-        umin >= s->used_u0 && vmin >= s->used_v0 && umax <= s->used_u1 &&
-        vmax <= s->used_v1) {
-        req_u0 = umin;
-        req_v0 = vmin;
-        req_u1 = umax;
-        req_v1 = vmax;
-        if (s->used_frame != frame_no) {
-            s->used_frame = frame_no;
-            s->last_used = ++tex_clock;
-        }
-        return s;
+    if (tex_window.log2_u | tex_window.log2_v) {
+        return FindTextureSlow(tpage, clut, variant, umin, vmin, umax, vmax);
+    }
+    uint32_t want = RequestId(tpage, clut, variant);
+    TexSlot* s = find_last;
+    if (s && Serves(s, want, umin, vmin, umax, vmax)) {
+        return Found(s, umin, vmin, umax, vmax);
     }
     unsigned cell = (unsigned)(umin >> 4 & 15) | (unsigned)(vmin >> 4 & 15) << 4;
     unsigned h = ((unsigned)clut * 0x9E3779B1u ^ (unsigned)tpage * 0x85EBCA6Bu ^
                   cell * 0xC2B2AE35u ^ (unsigned)variant) >>
                  22;
-    s = find_cache[h].slot;
-    if (s && find_cache[h].tpage == tpage && find_cache[h].clut == clut &&
-        find_cache[h].cell == cell && find_cache[h].variant == variant &&
-        s->key == find_cache[h].key &&
-        s->valid && !s->dirty && !(tex_window.log2_u | tex_window.log2_v) &&
-        umin >= s->used_u0 && vmin >= s->used_v0 && umax <= s->used_u1 &&
-        vmax <= s->used_v1) {
-        req_u0 = umin;
-        req_v0 = vmin;
-        req_u1 = umax;
-        req_v1 = vmax;
-        if (s->used_frame != frame_no) { // drawn this frame: keep it
-            s->used_frame = frame_no;
-            s->last_used = ++tex_clock;
-        }
-        goto found;
+    unsigned i = find_cache[h];
+    if (i && Serves(&tex_slots[i - 1], want, umin, vmin, umax, vmax)) {
+        return Found(&tex_slots[i - 1], umin, vmin, umax, vmax);
     }
     s = FindTextureSlow(tpage, clut, variant, umin, vmin, umax, vmax);
-    find_cache[h].slot = s;
-    find_cache[h].key = s ? s->key : 0;
-    find_cache[h].tpage = tpage;
-    find_cache[h].clut = clut;
-    find_cache[h].cell = (uint16_t)cell;
-    find_cache[h].variant = (uint8_t)variant;
-found:
-    find_last.slot = s;
-    find_last.key = s ? s->key : 0;
-    find_last.tpage = tpage;
-    find_last.clut = clut;
-    find_last.variant = (uint8_t)variant;
+    find_cache[h] = s ? (uint16_t)(s - tex_slots + 1) : 0;
+    find_last = s;
     return s;
 }
 

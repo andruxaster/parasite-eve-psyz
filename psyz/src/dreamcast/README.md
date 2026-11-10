@@ -66,7 +66,13 @@ the desktop software renderer. Not yet on hardware or in an emulator.
   written into a store queue with no copy in between; one across the edge
   is clipped on the CPU. Fills and uploads ignore the area. The texture
   found for the previous primitive is tried before the find cache, as
-  primitives come in runs of one texture.
+  primitives come in runs of one texture. The find cache holds only slot
+  numbers (2 KB, to stay in the SH-4's 16 KB operand cache): a slot answers
+  when it holds the request's texture (a 32-bit id of page, depth and CLUT
+  kept in the slot) and its drawn area covers the texels asked for.
+- **Ordering tables.** ClearOTagR writes whole 32-byte cache lines with
+  `movca.l`, which takes a line without reading it from memory first; the
+  walk prefetches the next entry and the table ahead.
 - **Texture windows** (GP0 E2) that repeat a tile, the usual kind, take a
   block of one period (at least 16 texels, the tile repeating inside it)
   that the PVR repeats; dialog boxes fill with a 32x32 tile this way.
