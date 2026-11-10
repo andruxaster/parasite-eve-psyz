@@ -7,6 +7,7 @@
 #endif
 #include <psyz.h>
 #include <psyz/log.h>
+#include <psyz/hot.h>
 #include <libgpu.h>
 #include "../internal.h"
 
@@ -2540,7 +2541,7 @@ void Psyz_GteRtps(void) {
     (void)sxy;
 }
 
-void Psyz_GteRtpt(void) {
+PSYZ_HOT_GEOM void Psyz_GteRtpt(void) {
     unsigned sxy0, sxy1, sxy2;
     RTPT_BODY(1, 0, sxy0, sxy1, sxy2);
     (void)sxy0, (void)sxy1, (void)sxy2;
@@ -2570,7 +2571,7 @@ static void RTPT(unsigned int cmd25) {
 }
 
 // MAC/IR = m * v + t, flags ORed into FLAG
-static inline void mat_vec(int sf, int lm, const short (*m)[3], int vx, int vy,
+PSYZ_HOT_GEOM static inline void mat_vec(int sf, int lm, const short (*m)[3], int vx, int vy,
                            int vz, int t1, int t2, int t3) {
     int m1, m2, m3, low1, low2, low3, ir1, ir2, ir3;
     int ir_lo = lm ? 0 : -0x8000;
@@ -3061,7 +3062,7 @@ void Psyz_GteStsxy3Gt3(void* polyGte) {
     poly->y2 = SY2;
 }
 
-void Psyz_GteAvsz3(void) { AVSZ3(); }
+PSYZ_HOT_GEOM void Psyz_GteAvsz3(void) { AVSZ3(); }
 void Psyz_GteAvsz4(void) { AVSZ4(); }
 void Psyz_GteDpcs(void) { DPCS(0x0780010); }
 void Psyz_GteNccs(void) { NCCS(0x108041B); }
@@ -3071,8 +3072,8 @@ void Psyz_GteLcir(void) {
     mat_vec(sf, lm, L2.m, IR1, IR2, IR3, 0, 0, 0);
     FLAG_UPDATE_ERROR();
 }
-void Psyz_GteNclip(void) { NCLIP(); }
-void Psyz_GteRt(void) {
+PSYZ_HOT_GEOM void Psyz_GteNclip(void) { NCLIP(); }
+PSYZ_HOT_GEOM void Psyz_GteRt(void) {
     FLAG = 0;
     mat_vec(1, 0, M.m, V0.vx, V0.vy, V0.vz, M.t[0], M.t[1], M.t[2]);
     FLAG_UPDATE_ERROR();

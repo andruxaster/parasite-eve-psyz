@@ -73,6 +73,13 @@ the desktop software renderer. Not yet on hardware or in an emulator.
 - **Ordering tables.** ClearOTagR writes whole 32-byte cache lines with
   `movca.l`, which takes a line without reading it from memory first; the
   walk prefetches the next entry and the table ahead.
+- **Instruction cache.** The SH-4's is 8 KB and direct-mapped. The hot code
+  of each phase of a frame shares one of KOS's icache-sized sections
+  (`psyz/hot.h`): drawing (the OT walk, `Draw_PushPrim` with `PushPoly`,
+  `FindTexture`) in `.sub0`, geometry (RTPT, NCLIP, AVSZ3, MVMVA rt and the
+  game's model loop) in `.sub1`, so within a phase they never evict each
+  other. The linker checks that each fits; the clipping path and lines stay
+  out of line to make room.
 - **Texture windows** (GP0 E2) that repeat a tile, the usual kind, take a
   block of one period (at least 16 texels, the tile repeating inside it)
   that the PVR repeats; dialog boxes fill with a 32x32 tile this way.

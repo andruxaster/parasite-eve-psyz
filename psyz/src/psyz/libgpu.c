@@ -9,6 +9,7 @@
 #include <psyz/gpu.h>
 #include "../../../decomp/src/libgpu/libgpu_private.h"
 #include <psyz/log.h>
+#include <psyz/hot.h>
 #include "../draw.h"
 #include "../internal.h"
 #include <stdlib.h>
@@ -319,7 +320,7 @@ static int is_packed_command_stream(const u32* words, int count) {
     return 0;
 }
 
-static void GPU_Enqueue(u_long* packets) {
+PSYZ_HOT_DRAW static void GPU_Enqueue(u_long* packets) {
     DR_ENV* env = (DR_ENV*)packets;
     if (sizeof(u_long) == 4) {
         // fast path for 32-bit systems

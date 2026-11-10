@@ -26,6 +26,7 @@
 // textured colors. Subtractive blending (mode 2) takes three passes.
 #include <psyz.h>
 #include <psyz/log.h>
+#include <psyz/hot.h>
 #include <libgpu.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -860,8 +861,9 @@ static inline TexSlot* Found(TexSlot* s, int umin, int vmin, int umax,
     return s;
 }
 
-static TexSlot* FindTexture(u16 tpage, u16 clut, int variant, int umin,
-                            int vmin, int umax, int vmax) {
+PSYZ_HOT_DRAW static TexSlot* FindTexture(u16 tpage, u16 clut, int variant,
+                                          int umin, int vmin, int umax,
+                                          int vmax) {
     if (tex_window.log2_u | tex_window.log2_v) {
         return FindTextureSlow(tpage, clut, variant, umin, vmin, umax, vmax);
     }
@@ -1579,7 +1581,9 @@ static inline void EmitVertex(float x, float y, float u, float v,
 }
 
 // n vertices in triangle-strip order
-static void SubmitStrip(const Vtx* v, int n, TexSlot* t, int mode,
+// out of line: the slow path, kept out of PushPoly and its cache section
+__attribute__((noinline)) static void SubmitStrip(const Vtx* v, int n,
+                                                  TexSlot* t, int mode,
                         bool filter) {
     Vtx clipped[12];
     if (clip_to_area) {
@@ -2093,7 +2097,7 @@ static int PacketLength(const u_long* packets, int max_len) {
     return len > max_len ? max_len : len;
 }
 
-static void PushPoly(const u_long* p, int code) {
+PSYZ_HOT_DRAW static void PushPoly(const u_long* p, int code) {
     bool textured = (code & TEXTURED) != 0;
     bool gouraud = (code & GOURAUD) != 0;
     bool semitrans = (code & SEMITRANSP) != 0;
@@ -2279,7 +2283,8 @@ static void PushRect(const u_long* p, int code) {
              clut, semitrans);
 }
 
-static void PushLine(const u_long* p, int len, int code) {
+// out of line: lines are rare, and PushPrim's cache section is full
+__attribute__((noinline)) static void PushLine(const u_long* p, int len, int code) {
     bool gouraud = (code & GOURAUD) != 0;
     int mode = BlendMode((code & SEMITRANSP) != 0, cur_tpage);
     uint32_t c1 = (uint32_t)p[0];
@@ -2317,7 +2322,7 @@ static void PushLine(const u_long* p, int len, int code) {
     }
 }
 
-int Draw_PushPrim(u_long* packets, int max_len) {
+PSYZ_HOT_DRAW int Draw_PushPrim(u_long* packets, int max_len) {
     int len = PacketLength(packets, max_len);
     int code = (int)(*packets >> 24) & 0xFF;
     int need = code >= 0x40 && code < 0x60 && (code & EXTRA_VERTEX) ? 3 : len;
